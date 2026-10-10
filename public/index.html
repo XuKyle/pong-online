@@ -1,0 +1,2601 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<!-- viewport-fit=cover 是为了让全面屏手机把 env(safe-area-inset-*) 报出真实值；
+     不写这一行，安全区恒为 0，横屏铺满时按钮会压在手机的圆角和手势条上。
+     电脑端不读 viewport，这一行对电脑端没有任何影响。 -->
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<title>双人乒乓球 · 联机探针</title>
+<!-- 内联站点图标。不写这一行，浏览器会自动去要 /favicon.ico，而静态服务器没有这个
+     文件，于是控制台留下一条 404 红字 —— 功能没问题，但容易被误读成故障。
+     用 data URI 内联，既不产生额外请求，也不需要多传一个文件。 -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230f172a'/%3E%3Crect x='7' y='11' width='4' height='10' rx='2' fill='%2360a5fa'/%3E%3Crect x='21' y='11' width='4' height='10' rx='2' fill='%23fb923c'/%3E%3Ccircle cx='16' cy='16' r='3.2' fill='%23e2e8f0'/%3E%3C/svg%3E">
+<style>
+  :root {
+    --bg: #f4f6fa;
+    --card: #ffffff;
+    --line: #e2e7f0;
+    --text: #1c2434;
+    --muted: #6b7890;
+    --faint: #97a3b8;
+    --accent: #2f6fd0;
+    --accent-ink: #ffffff;
+    --ok: #1f8a54;
+    --warn: #b7791f;
+    --bad: #c0392b;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+                 "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    -webkit-text-size-adjust: 100%;
+  }
+  .wrap { max-width: 940px; margin: 0 auto; padding: 16px 14px 40px; }
+
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 12px; margin-bottom: 14px; flex-wrap: wrap;
+  }
+  .brand { font-size: 16px; font-weight: 500; letter-spacing: .2px; }
+  .brand span { color: var(--faint); font-weight: 400; font-size: 13px; margin-left: 6px; }
+  .badge {
+    font-size: 12px; padding: 4px 10px; border-radius: 999px;
+    border: 1px solid var(--line); background: #fff; color: var(--muted);
+    white-space: nowrap;
+  }
+  .badge.ok { color: var(--ok); border-color: #bfe3cd; background: #f0faf4; }
+  .badge.warn { color: var(--warn); border-color: #f0dfb8; background: #fdf8ec; }
+  .badge.bad { color: var(--bad); border-color: #f0c8c2; background: #fdf1ef; }
+
+  /* 顶部右侧控件组。画布是定宽 100% + aspect-ratio，高度不受页眉影响，
+     所以这里多放一个控件不会连带压到画面尺寸。 */
+  .hright { display: flex; align-items: center; gap: 8px; }
+  .soundbtn {
+    font: inherit; font-size: 15px; line-height: 1; cursor: pointer;
+    padding: 5px 9px; border-radius: 8px;
+    border: 1px solid var(--line); background: #fff; color: var(--muted);
+  }
+  .soundbtn:hover { border-color: #cfd8e6; }
+  .soundbtn.off { opacity: .6; }
+  /* 暂停中：按钮变成「继续」并高亮，让"现在停着"一眼可见。
+     沿用 .soundbtn 的尺寸与响应式规则，所以手机上它自动就是 36×36 的可点面积。 */
+  .soundbtn.active { border-color: var(--accent); color: var(--accent); background: #eef4ff; }
+
+  .stage {
+    position: relative; margin: 0 auto; max-width: 940px;
+    /* 宽高比由 JS 按当前场地写进 --ar（coop 的球台比经典模式高得多）。
+       同时按视口高度反推一个最大宽度 —— 不然竖着的场地会顶出屏幕，
+       玩家得滚动才能看见自己那半场。
+       --reserve 是"页眉 + 下面那堆面板"占掉的高度：手机上那些面板被隐藏了，
+       预留高度跟着调小，球场就能大一圈（见文件末尾的窄屏块）。
+       ★ 桌面端**不覆盖**这个变量，所以还是 210px，和加手机端之前逐像素一致。 */
+    --reserve: 210px;
+    width: min(100%, calc((100vh - var(--reserve)) * var(--ar, 1.6)));
+    aspect-ratio: var(--ar, 1.6);
+    border-radius: 12px; overflow: hidden;
+    background: #0d1220; border: 1px solid #1b2540;
+  }
+  canvas { display: block; width: 100%; height: 100%; touch-action: none; }
+
+  .overlay {
+    position: absolute; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(9, 13, 24, .84);
+    padding: 18px; text-align: center;
+  }
+  .overlay.hidden { display: none; }
+  .panelbox { width: 100%; max-width: 380px; color: #e8eefb; }
+  .panelbox h2 { font-size: 17px; font-weight: 500; margin: 0 0 6px; }
+  .panelbox p { font-size: 13px; color: #93a3bf; margin: 0 0 16px; line-height: 1.6; }
+  .panelbox .hint { font-size: 12px; color: #6f7f9c; margin-top: 14px; }
+
+  button {
+    font: inherit; font-size: 14px; cursor: pointer;
+    border-radius: 8px; border: 1px solid transparent;
+    padding: 10px 16px; transition: filter .12s;
+  }
+  button:active { filter: brightness(.94); }
+  button:disabled { opacity: .5; cursor: default; }
+  .primary { background: var(--accent); color: var(--accent-ink); width: 100%; }
+  .ghost { background: #1a2440; color: #cfdcf3; border-color: #2b3a5e; }
+  .ghost:hover { background: #223055; }
+
+  .joinrow { display: flex; gap: 8px; margin-top: 10px; }
+  input[type=text] {
+    flex: 1; min-width: 0; font: inherit; font-size: 15px;
+    letter-spacing: 3px; text-transform: uppercase; text-align: center;
+    padding: 10px 12px; border-radius: 8px;
+    border: 1px solid #2b3a5e; background: #131c30; color: #e8eefb;
+    outline: none;
+  }
+  input[type=text]:focus { border-color: var(--accent); }
+  input[type=text]::placeholder { letter-spacing: 1px; color: #55647f; }
+
+  .code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 34px; letter-spacing: 8px; color: #7db4ff;
+    margin: 4px 0 14px; text-indent: 8px;
+  }
+  .waitdot { display: inline-block; animation: blink 1.4s infinite; }
+  @keyframes blink { 0%,100% { opacity: .25; } 50% { opacity: 1; } }
+
+  /* 菜单里的分隔与难度选择 */
+  .divider {
+    display: flex; align-items: center; gap: 8px;
+    margin: 16px 0 10px; color: #5f6f8c; font-size: 12px;
+  }
+  .divider::before, .divider::after { content: ""; flex: 1; height: 1px; background: #2b3a5e; }
+  .segrow { display: flex; gap: 6px; margin-top: 8px; }
+  .seglabel { font-size: 12px; color: #5f6f8c; text-align: left; }
+  /* 两个 AI 入口并排 —— 分成两行会把菜单拉得太长，并排也更好比较 */
+  .duorow { display: flex; gap: 8px; margin-top: 10px; }
+  .duorow > button { flex: 1; min-width: 0; }
+
+  /* ---- 拍子皮肤（颜色 = 技能） ---- */
+  /* 四个色块并排。色块本身就是"拍子长什么样"的缩略图，比写四个色名直观。 */
+  .skinrow { display: flex; gap: 6px; margin-top: 8px; }
+  .skinrow .swatch {
+    flex: 1; min-width: 0; display: flex; flex-direction: column;
+    align-items: center; gap: 4px; padding: 7px 0 6px;
+    font-size: 11px; line-height: 1.15;
+    border-radius: 8px; border: 1px solid #2b3a5e; background: #131c30; color: #9fb0cc;
+  }
+  .skinrow .swatch i {
+    display: block; width: 11px; height: 22px; border-radius: 4px;
+    background: #8a93a6; border: 1px solid rgba(0, 0, 0, .35);
+  }
+  .skinrow .swatch.on { border-color: var(--accent); background: #1b2b4a; color: #dbe8ff; }
+
+  /* ---- 技能按钮 ---- */
+  /* 浮在球场两侧、跟着自己的那条拍子上下走。
+     ★ position:fixed 而不是 absolute：.stage 有 overflow:hidden，挂在里面会被裁掉；
+       挂在 .wrap 上则要看它是不是定位祖先（横屏块里它正好是，桌面端不是）——
+       fixed 让包含块恒为视口，两种情况都不会被裁，也不用去改 .wrap 的 position
+       （那会顺带改掉 .solobar 的包含块，横屏布局会跟着变）。 */
+  .skillbtn {
+    position: fixed; z-index: 5; left: 0; top: 0;
+    width: 38px; height: 38px; padding: 0; margin: 0;
+    border-radius: 50%; border: 2px solid #2b3a5e; background: #101a2e;
+    color: #cfdcf3; font: 500 15px/1 ui-monospace, Menlo, Consolas, monospace;
+    display: none; align-items: center; justify-content: center;
+    overflow: hidden; cursor: pointer;
+    box-shadow: 0 2px 10px rgba(0, 0, 0, .45);
+    -webkit-tap-highlight-color: transparent;
+  }
+  .skillbtn.ready { border-color: currentColor; }
+  /* 冷却遮罩：从上往下退去的一圈暗色（--p 是"还剩多少"，1 → 0）。
+     ★ 用 conic-gradient 而不是再画一个 DOM —— 一个变量就能驱动，不需要每帧改结构。 */
+  .skillbtn::after {
+    content: ''; position: absolute; inset: -1px; border-radius: 50%;
+    background: conic-gradient(rgba(4, 8, 16, .8) calc(var(--p, 0) * 1turn), rgba(4, 8, 16, 0) 0);
+    pointer-events: none;
+  }
+  /* 别人的技能按钮：只当仪表盘看，不可点（点了也没有任何含义）。
+     缩一圈 + 去掉描边，一眼就能和"我自己那个能按的"区分开。 */
+  .skillbtn.foreign { pointer-events: none; opacity: .55; transform: scale(.84); }
+  .seg {
+    flex: 1; font: inherit; font-size: 13px; padding: 8px 0; cursor: pointer;
+    border-radius: 8px; border: 1px solid #2b3a5e; background: #131c30; color: #9fb0cc;
+  }
+  .seg:hover { background: #1a2440; }
+  .seg.on { border-color: var(--accent); background: #1b2b4a; color: #dbe8ff; }
+
+  /* 人机模式的常驻栏：solo 时画布上没有"等待对手"的遮罩可以挂退出按钮，
+     所以单独给一条，否则进了人机就再也回不去菜单。 */
+  .solobar {
+    display: flex; align-items: center; justify-content: space-between; gap: 10px;
+    margin-top: 12px; padding: 10px 14px; font-size: 13px; color: var(--muted);
+    background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+  }
+  .solobar b { color: var(--text); font-weight: 500; }
+  .smallbtn { padding: 7px 12px; font-size: 13px; }
+
+  .meters {
+    margin-top: 16px; background: var(--card);
+    border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px;
+  }
+  .meters h3 {
+    margin: 0 0 10px; font-size: 13px; font-weight: 500; color: var(--muted);
+    display: flex; align-items: center; gap: 8px;
+  }
+  .meters h3::after { content: ""; flex: 1; height: 1px; background: var(--line); }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(132px, 1fr)); gap: 10px 16px; }
+  .m .k { font-size: 11px; color: var(--faint); margin-bottom: 3px; }
+  .m .v { font-size: 15px; font-variant-numeric: tabular-nums; }
+  .m .v small { font-size: 11px; color: var(--faint); margin-left: 2px; }
+  .verdict {
+    margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line);
+    font-size: 13px; line-height: 1.65; color: var(--muted);
+  }
+  .verdict b { color: var(--text); font-weight: 500; }
+  .tip { font-size: 12px; color: var(--faint); margin-top: 10px; line-height: 1.6; }
+  .keys { font-family: ui-monospace, Menlo, Consolas, monospace; }
+
+  /* ---------- 手机端专属元素：电脑端一律不显示 ---------- */
+
+  /* 顶部延迟胶囊。桌面已经有完整的「链路实测」面板，再挂一个胶囊是重复信息。
+     默认 display:none 还有个好处：它**完全不参与桌面布局**，
+     连 .hright 的 gap 都不会被它撑开 —— 这是"不影响电脑端"的前提。 */
+  .ping { display: none; font-variant-numeric: tabular-nums; }
+  .rotatetip { display: none; }
+
+  /* 手机上浏览器会把划到边缘当成"后退"，玩到一半划一下页面就没了 */
+  html, body { overscroll-behavior: none; }
+  button, .seg, .soundbtn, input { -webkit-tap-highlight-color: transparent; }
+
+  /* ================= 手机端 · 窄屏（竖屏手机 / 很窄的窗口） =================
+     只在视口宽度 ≤760px 时生效。电脑端（1280px 那种）根本不匹配这一块，
+     所以下面怎么改都不可能碰到电脑端。 */
+  @media (max-width: 760px) {
+    .wrap { padding: 10px 10px 24px; }
+    header { margin-bottom: 10px; }
+    .brand { font-size: 15px; }
+    .brand span { display: none; }        /* 副标题「联机探针」手机上没必要占位 */
+    .stage { --reserve: 118px; }          /* 下面那堆面板都藏了，预留高度跟着收 */
+
+    .ping { display: inline-block; }
+
+    /* 桌面那个 27px 高的声音按钮在手机上偏小（手指点不准），撑到 36×36。
+       这是手机端特有的毛病：鼠标指针只要 1px 就能命中，手指需要几十像素。 */
+    .soundbtn { min-width: 36px; min-height: 36px; display: inline-flex;
+                align-items: center; justify-content: center; }
+
+    /* 链路实测面板整块收起。数据照常采集（renderMeters 还在跑），只是不显示。 */
+    .meters { display: none; }
+
+    /* 菜单改成整屏抽屉。竖屏时球场只有两百来像素高，而菜单内容有四百多像素，
+       硬塞进那个框里会被 .stage 的 overflow:hidden 裁掉一半。
+       改成 position:fixed 让它脱离球场、铺满屏幕并且能滚。
+       ★ .stage 确实是 overflow:hidden，但 fixed 元素在祖先没有 transform/filter 时
+         不会被祖先的 overflow 裁掉，所以这里能正常逃出来。 */
+    .overlay {
+      position: fixed; inset: 0;
+      overflow-y: auto; overscroll-behavior: contain;
+      -webkit-overflow-scrolling: touch;
+    }
+    .solobar { padding: 8px 12px; }
+  }
+
+  /* 竖屏才提示「横过来」——已经是横屏了还提示就荒唐了。
+     ★ 必须单独一条查询：667×375 这种横屏小机同时满足 max-width:760，
+       把这条混进上面那块的话，横屏时会一边提示横屏、一边按横屏排版，
+       自相矛盾而且探针也测不出来是哪条生效。 */
+  @media (max-width: 760px) and (orientation: portrait) {
+    .rotatetip {
+      /* ★ 必须 position:fixed 浮在上层。竖屏时菜单是整屏抽屉（也是 fixed），
+         提示留在文档流里会被抽屉整个盖住 —— 探针量得出它"有面积"、判定通过，
+         玩家却一个字都看不到。"量到了"不等于"看得见"，这里吃过一次亏。
+         顺便把提示做成底部悬浮条：手机上一眼就能看到，也不用滚。 */
+      position: fixed; left: 10px; right: 10px; z-index: 7;
+      bottom: calc(10px + env(safe-area-inset-bottom));
+      display: block;                     /* 基础样式里是 display:none，这里必须显式打开 */
+      margin: 0; padding: 9px 12px; text-align: center;
+      font-size: 12px; line-height: 1.5;
+      color: #cfdcf3; background: rgba(26, 36, 64, .95);
+      border: 1px solid #2b3a5e; border-radius: 12px;
+    }
+    /* 给抽屉留出提示条的高度，否则最后一个按钮会滑到它下面点不到 */
+    .overlay { padding-bottom: calc(76px + env(safe-area-inset-bottom)); }
+  }
+
+  /* ================= 手机端 · 横屏铺满 =================
+     条件写「横屏 + 视口高 ≤560 + 宽 ≤1100」，刻意不用 pointer:coarse ——
+     视口尺寸是无头探针能精确控制的量，而 pointer 媒体特性在仿真环境里不可靠，
+     一条没法在测试里复现的断点等于没测过。
+     代价：电脑上把窗口拖到又矮又窄（≤1100×560）也会进这套布局。那本来就是个
+     别扭的尺寸，进铺满布局只会更好用，不算回归。 */
+  @media (orientation: landscape) and (max-height: 560px) and (max-width: 1100px) {
+    .wrap { padding: 0; position: relative; }
+
+    /* 页眉改成浮在球场上的一条，不再占纵向高度 —— 省下的一百多像素全给球场。
+       pointer-events 要逐层放行：header 是 left:0;right:0 的整条，
+       手不放行的话这条透明横带会把球场右上角的触摸拖动全部吃掉。 */
+    header {
+      position: absolute; top: 0; left: 0; right: 0; z-index: 6;
+      margin: 0; padding: calc(6px + env(safe-area-inset-top)) 12px 6px;
+      justify-content: flex-end; pointer-events: none;
+    }
+    header .brand, header .hright { pointer-events: none; }
+    /* 只给真正要点的按钮放行；只读的徽章 / 延迟胶囊保持穿透。
+       ★ 它们**照常绘制** —— 透明的是"命中测试"，不是"绘制"。
+       所以"胶囊到底看不看得见"不能用 elementFromPoint 直接问：它会跳过 pe:none
+       的元素，拿到的是下面那一层（实测拿到 .overlay），看着像"被盖住了"。
+       探针里要先把该元素临时放行、问完立刻还原（probe-mobile / probe-crossplay 都这么做）。 */
+    header .soundbtn { pointer-events: auto; }
+    .brand { display: none; }
+
+    /* 球场是 1.6 的横条，手机横屏普遍是 2.1 左右，所以左右一定会剩两条。
+       留白底的话夜里玩就是"黑画面外镶一圈白"，很刺眼；把页面底色也换成球场色，
+       整屏看起来就是一整块。★ 不要把 .stage 的边框也一起去掉 ——
+       画布只画了上下墙（fillRect(0,0,W,3)），左右两条边是靠这个 border 划出来的，
+       去掉之后"球会在哪里出界"就没有视觉依据了。
+       只改 background，不动 border，所以 .stage 的矩形尺寸一个像素没变。 */
+    html, body { background: #0d1220; }
+    .stage {
+      border-radius: 0; max-width: none;
+      /* 球场铺满：高度吃满视口，宽度按球场比例反推，两侧留白居中。
+         dvh 才会跟着手机地址栏收放；不认识 dvh 的浏览器直接丢掉后一行、用前一行。 */
+      width: min(100vw, calc(100vh * var(--ar, 1.6)));
+      width: min(100vw, calc(100dvh * var(--ar, 1.6)));
+    }
+
+    .ping { display: inline-block; }
+    .meters { display: none; }
+
+    /* 铺满之后页眉浮在球场上，按钮太小会挡不住也点不准 */
+    .soundbtn { min-width: 36px; min-height: 36px; display: inline-flex;
+                align-items: center; justify-content: center; }
+    .badge { padding: 6px 10px; }
+
+    /* ★ 这条栏以前贴在**左下角**，而横屏时自己的拍子就贴着球场左缘 —— 正好压在
+       自己拍子的活动带上，玩着玩着手指还得绕开它。改到最右边，并拆成两排
+       （上排文字、下排按钮），于是它的横向占地只剩原来一半左右，不再侵占自己的半场。
+
+       为什么 right 是相对屏幕而不是球场：这里它是 absolute 且没有定位祖先，
+       包含块就是初始包含块（视口），`left:12px` 当年就是这么落在屏幕左缘的。
+       所以 `right: 8px` 会贴屏幕右缘 —— 球场两侧本来就有留白时，它整个落在留白里，
+       连对手的拍子都不挡。 */
+    .solobar {
+      position: absolute; left: auto; z-index: 6;
+      right: calc(8px + env(safe-area-inset-right));
+      bottom: calc(8px + env(safe-area-inset-bottom));
+      flex-direction: column; align-items: flex-end; gap: 4px;
+      margin: 0; padding: 6px 10px;
+      font-size: 11px; line-height: 1.25; white-space: nowrap;
+      background: rgba(13, 18, 32, .72); border-color: #2b3a5e; color: #cfdcf3;
+    }
+    .solobar .smallbtn { padding: 5px 10px; font-size: 11px; }
+    .solobar b { color: #e8eefb; }
+
+    /* 横屏只有 375~390 高，菜单按桌面那套行距会高过屏幕被裁掉。压紧行距，
+       并改成整屏可滚抽屉（同样是为了不被 .stage 的 overflow:hidden 裁掉）。 */
+    .overlay {
+      position: fixed; inset: 0;
+      align-items: flex-start; overflow-y: auto;
+      overscroll-behavior: contain; -webkit-overflow-scrolling: touch;
+      padding: 12px 16px calc(12px + env(safe-area-inset-bottom));
+    }
+    .panelbox { max-width: 560px; margin: 0 auto; }
+    .panelbox h2 { font-size: 15px; margin-bottom: 3px; }
+    .panelbox p { font-size: 12px; margin-bottom: 10px; line-height: 1.45; }
+    .panelbox .hint { font-size: 11px; margin-top: 9px; }
+    .divider { margin: 10px 0 8px; }
+    .code { font-size: 26px; letter-spacing: 6px; margin-bottom: 10px; }
+    button { padding: 9px 14px; }
+    .duorow, .joinrow, .segrow { margin-top: 8px; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <div class="brand">双人乒乓球 <span>联机探针</span></div>
+    <div class="hright">
+      <button class="soundbtn" id="sfxBtn" title="声音开关（快捷键 M）">🔊</button>
+      <!-- 暂停 / 继续（快捷键 P）。★ 默认 display:none 有两个理由：
+           ① 菜单里没什么可暂停的，摆着只会让人以为能暂停"匹配"；
+           ② 更重要的是它**完全不参与布局** —— 没有盒子、也不占 .hright 的 gap，
+              所以桌面端静止状态下每个盒子的尺寸都和加这个按钮之前逐像素一致
+              （probe-mobile 的电脑端几何基线正是靠这一点继续成立的）。
+           只在「已入座 且 不是 waiting」时才显示，见 syncPauseBtn。 -->
+      <button class="soundbtn" id="pauseBtn" style="display:none"
+              title="暂停 / 继续（快捷键 P）">暂停</button>
+      <div class="badge" id="netBadge">未连接</div>
+      <!-- 手机端顶部的延迟读数。桌面端 CSS 里是 display:none，
+           所以它既不显示、也不参与桌面布局（放在 netBadge 后面还是前面都一样）。 -->
+      <div class="badge ping" id="pingPill">—</div>
+    </div>
+  </header>
+
+  <div class="stage">
+    <canvas id="game"></canvas>
+    <div class="overlay" id="overlay">
+      <div class="panelbox" id="overlayBody"></div>
+    </div>
+  </div>
+
+  <!-- 竖屏时才出现的提示。球场是 800×500 的横条，竖着拿只能占屏幕中间一条，
+       横过来才能铺满 —— 所以直接把这句话写出来，别让玩家自己猜。
+       电脑端 display:none，不进布局。 -->
+  <div class="rotatetip" id="rotateHint">把手机横过来玩，球场会铺满整个屏幕</div>
+
+  <div class="solobar" id="soloBar" style="display:none">
+    <span id="soloText">对手 <b id="soloLabel">AI</b></span>
+    <button class="ghost smallbtn" id="soloLeave">返回菜单</button>
+  </div>
+
+  <div class="meters">
+    <h3>链路实测</h3>
+    <div class="grid">
+      <div class="m"><div class="k">连接方式</div><div class="v" id="mTransport">—</div></div>
+      <div class="m"><div class="k">往返延迟</div><div class="v" id="mRtt">—</div></div>
+      <div class="m"><div class="k">快照频率</div><div class="v" id="mRate">—</div></div>
+      <div class="m"><div class="k">服务端推进</div><div class="v" id="mTickRate">—</div></div>
+      <div class="m"><div class="k">已收快照</div><div class="v" id="mSnaps">0</div></div>
+      <div class="m"><div class="k">断线次数</div><div class="v" id="mDrops">0</div></div>
+    </div>
+    <div class="verdict" id="verdict">
+      等待连接。连上后这里会给出到底走没走通长连接的结论。
+    </div>
+    <div class="tip">
+      操作：电脑用 <span class="keys">↑ / ↓</span> 或 <span class="keys">W / S</span>；
+      手机在画面上上下滑动；<span class="keys">M</span> 开关声音；
+      <span class="keys">P</span> 暂停 / 继续（两个人都能按）；
+      <span class="keys">Q</span> 放技能（也可以点球场边上的圆钮）。<br>
+      先到 <b>11 分</b>获胜；若打到 <b>10 平</b>，必须净胜 2 分才算赢。<br>
+      <b>双人打 AI</b>：两个真人各守球台的一半（上半场 / 下半场），
+      AI 在对面全高度移动、速度更快。<br>
+      场上随机出现道具，球碰到就归最后击球的一方：
+      <span class="keys">+</span> 加长自己 ·
+      <span class="keys">–</span> 削短对方 ·
+      <span class="keys">»</span> 球加速 ·
+      <span class="keys">❄</span> 冰冻对方 ·
+      <span class="keys">◍</span> 护盾（挡一次失分）·
+      <span class="keys">2×</span> 双倍得分 ·
+      <span class="keys">~</span> 弧线球（球一路拐弯）。
+    </div>
+  </div>
+
+  <!-- 技能按钮。最多三个（coop 是两个真人 + AI，AI 是灰板子所以不会出现）。
+       静态写在这里、默认 display:none 有两个用处：
+         ① 位置由 JS 每帧算（要跟着拍子走），没法用 CSS 排；
+         ② 菜单态下它们都是 0×0 的隐藏盒，于是电脑端几何基线里
+            "菜单里不能多出任何盒子"这条自动成立（和暂停按钮同一个套路）。
+       ★ 用 <button> 而不是 <div>：触屏那段的 touchHitsUI() 靠 closest('button')
+          把"点击 UI"和"拖动球拍"分开，换成 div 的话按一下技能会顺手把拍子拖走。 -->
+  <button class="skillbtn" id="skillBtn0" style="display:none"></button>
+  <button class="skillbtn" id="skillBtn1" style="display:none"></button>
+  <button class="skillbtn" id="skillBtn2" style="display:none"></button>
+
+</div>
+
+<script>
+(function () {
+  'use strict';
+
+  // ---------- 与服务端共用的常量（必须保持一致） ----------
+  // ★ W / H 是**可变的**：各模式的场地不一样（coop 的球台更高），
+  //   服务端每帧把真实尺寸放在快照的 wh 里下发，收到就更新这两个变量。
+  //   渲染代码全部读它们，所以换场地不需要改任何绘制逻辑。
+  var W = 800, H = 500;
+  var PADDLE_W = 14, PADDLE_H = 96, PADDLE_MARGIN = 26, BALL_R = 9;
+  var PADDLE_SPEED = 540;
+  var WIN_SCORE = 11, WIN_MARGIN = 2;
+  var POWERUP_R = 21;   // 必须和服务端一致，否则画出的大小和实际碰撞范围对不上
+  var POWERUP_MAX = 3;  // 场上最多同时几个。只用于诊断上报，绘制是按服务端下发的数组逐个画
+  var TICK_HZ = 30;
+  // ★ 必须与服务端一致。只用来把"风还剩几秒"归一成 0~1 好算渐入渐出 ——
+  //   风的真正时长、施力大小全在服务端，客户端一秒钟都不参与物理。
+  //   （这条是探针在真实浏览器里抓出来的：漏了它 drawWind 会直接抛异常，
+  //     而异常发生在 loop 里 draw() 之后、requestAnimationFrame 之前 ⇒ **整个渲染循环当场停摆**，
+  //     画面冻住但按钮还在更新，看着像"卡了"。）
+  var WIND_MS = 1000;
+
+  /**
+   * 拍子布局。必须与服务端的 buildSlots 完全一致。
+   * edge = 贴哪条边；team = 属于哪一队（决定配色与共享的道具效果）；span = 中心活动范围。
+   * 客户端原本用不到 span（位置是服务端算好的），但**本地预测**需要它 ——
+   * 不然 coop 里上半场那个玩家能把自己的拍子推出半场。
+   */
+  function slotsFor(mode, h) {
+    if (mode === 'coop') {
+      return [
+        { edge: 'left', team: 0, span: [0, h / 2] },
+        { edge: 'left', team: 0, span: [h / 2, h] },
+        { edge: 'right', team: 1, span: [0, h] }
+      ];
+    }
+    return [
+      { edge: 'left', team: 0, span: [0, h] },
+      { edge: 'right', team: 1, span: [0, h] }
+    ];
+  }
+
+  var COL = {
+    court: '#0d1220',
+    wall: '#1b2540',
+    mid: '#1e2a42',
+    p0: '#4da3ff',
+    p1: '#ff7a59',
+    ball: '#eef4ff',
+    text: '#8fa3bf',
+    faint: '#5b6b88',
+    good: '#4ade80'
+  };
+
+  /**
+   * coop 专用配色：**按槽位**取色，不是按队伍。
+   * 经典模式里两侧各是一队，一队一个颜色就够了；但 coop 里两名真人站在**同一条边**上、
+   * 只是各守半场 —— 沿用"按队配色"的话两人会是一模一样的蓝，根本分不清谁是谁。
+   * 顺序固定为 [上半场, 下半场, AI]，两个客户端看到的颜色一致（不是"各自眼里的自己一个色"），
+   * 这样一边喊"你往左一点"时，双方指的确实是同一条拍子。
+   * 蓝 / 黄绿 / 橙红 三色在深色场地上两两都拉得开。
+   */
+  var COOP_COL = ['#4da3ff', '#a3e635', '#ff7a59'];
+  // 被冰冻时整体换冰色（仍然保持三条互不相同，否则冻住之后又分不清了）
+  var COOP_COL_FROZEN = ['#9fd8ff', '#dcffa8', '#ffc0ae'];
+
+  // 道具外观：索引与服务端的类型编号一一对应。
+  // 都只用几何符号和 ASCII（❄ 除外），不用 emoji —— emoji 在很多字体下会被渲染成
+  // 彩色图形，和这里的扁平风格冲突，而且尺寸不可控。
+  var POWERUP_STYLE = [
+    { c: '#4ade80', label: '+' },    // 0 加长自己的拍子
+    { c: '#f87171', label: '–' },    // 1 削短对方的拍子
+    { c: '#fbbf24', label: '»' },    // 2 球加速
+    { c: '#7dd3fc', label: '❄' },    // 3 冰冻对方的拍子
+    { c: '#a78bfa', label: '◍' },    // 4 护盾：挡一次失分
+    { c: '#f0abfc', label: '2×' },   // 5 双倍得分（8 秒内自己进球算两分）
+    { c: '#5eead4', label: '~' },    // 6 弧线球（球一路拐弯，轨迹发飘）
+    { c: '#fdba74', label: 'Y' },    // 7 分裂球（原球不变，多出一个半速的球）
+    // 8 隐形球。用"近乎无色的白"是有意的：其它八款都是饱和色，
+    // 只有它是"没有颜色"，一眼就读得出这是"让东西看不见"的那一款。
+    { c: '#e2e8f0', label: '◌' }
+  ];
+  var LEVEL_NAMES = ['简单', '普通', '困难'];
+
+  // ---------- 拍子皮肤（颜色 = 技能） ----------
+  // 下标必须与服务端的 SKINS 一一对应：0 灰（无技能）/ 1 青（风）/ 2 黄（幻影）/ 3 红（超高速）。
+  var SKIN_NAMES = ['灰', '青', '黄', '红'];
+  var SKIN_DESC = ['无技能', '风', '幻影', '超高速'];
+  var SKIN_GLYPH = ['', '风', '幻', '速'];     // 按钮上写的字（灰没有按钮）
+  // 服务端配色必须能一眼对应上：青用一般动画里风系的青，黄用幻影的琥珀色，红用高速的警示红。
+  var SKIN_COL = ['#8a93a6', '#22d3ee', '#fbbf24', '#ef4444'];
+  // 被冰冻时整体换冰色，但仍然保持四个皮肤互不相同（否则冻住之后又分不清了）
+  var SKIN_COL_FROZEN = ['#9fb0c8', '#9fe8f5', '#f5dfa0', '#f0a8a8'];
+  // ★ 必须与服务端的 SKILL_CD_MS 一致。只用来画冷却环（--p 的分子），
+  //   能不能放、还剩多久都以服务端下发的 sc 为准 —— 这里错了只会让环画得不圆。
+  var SKIN_CD_S = [0, 10, 15, 10];
+
+  var skillBtnEls = [
+    document.getElementById('skillBtn0'),
+    document.getElementById('skillBtn1'),
+    document.getElementById('skillBtn2')
+  ];
+
+  // ---------- 我选的皮肤 ----------
+  // 存在本机（localStorage）而不是服务端：它是"我的偏好"，换房间、换对手都该跟着我走。
+  // ★ 带邀请链接进来的人是**自动加入**的、看不到菜单，所以这一份存储就是他们的皮肤来源。
+  var SKIN_KEY = 'pong.skin';
+  function readSkin() {
+    try {
+      var v = Number(localStorage.getItem(SKIN_KEY));
+      return (Number.isInteger(v) && v >= 0 && v < SKIN_COL.length) ? v : 0;
+    } catch (e) { return 0; }
+  }
+  function saveSkin(v) {
+    try { localStorage.setItem(SKIN_KEY, String(v)); } catch (e) {}
+  }
+  var mySkin = readSkin();
+
+  var canvas = document.getElementById('game');
+  var ctx = canvas.getContext('2d');
+  var overlay = document.getElementById('overlay');
+  var overlayBody = document.getElementById('overlayBody');
+  var netBadge = document.getElementById('netBadge');
+  var pauseBtn = document.getElementById('pauseBtn');
+
+  // ---------- 视图状态 ----------
+  var view = {
+    mySide: -1,
+    code: '',
+    connected: false,
+    wsUrl: '',
+    extensions: '',
+    handshakeMs: 0,
+
+    mode: 'duel',             // duel | solo | coop
+    slots: slotsFor('duel', H),
+    phase: 'waiting',
+    // 真人主动暂停。★ 与 phase 是**两个独立状态**：暂停期间 phase 还是 playing，
+    //   画面上球还在（只是冻住不动）—— 若把它并进 phase 走 waiting 分支，那条分支
+    //   压根不画球，一按暂停球就从画面上消失，看着像球被吞了。
+    userPaused: false,
+    pausedBy: -1,             // 是谁按的（槽位号，-1 = 没暂停）
+    // ★ 球是一个**数组**（分裂球会让场上同时有多个）。
+    //   服务端每个球都带 id，客户端按 id 维护它的平滑位置和尾迹 ——
+    //   不能用下标当身份：某个球出界后数组整体前移，剩下的球会被
+    //   从"上一个球的位置"平滑地滑过去，看起来像瞬移。
+    balls: [],                // 服务端真值 [{ id, x, y }]
+    ballDisps: {},            // id -> { x, y } 画出来的位置（指数平滑，抹平 30Hz 台阶）
+    tails: {},                // id -> [{x,y}] 弧线球尾迹
+    paddles: [H / 2, H / 2],
+    paddleDisp: [H / 2, H / 2],
+    paddleMul: [1, 1],        // 拍子长度倍率，决定画多长
+    powerups: [],             // 场上道具数组 [[x, y, type], ...] —— 可以同时有多个
+    freeze: [0, 0],           // 各队冰冻剩余秒数（>0 就是被冻着）
+    shield: [0, 0],           // 各队护盾剩余层数
+    double: [0, 0],           // 各队双倍得分是否生效
+    invis: [0, 0],            // 各队"看不见球"还剩几秒（>0 就是被隐形了）
+    invisAlpha: [1, 1],       // 各队**当前看到的球**的不透明度（1 看得见 / 0 看不见）
+    curve: 0,                 // 弧线球：非 0 表示球在拐弯（值是带符号的角速度）
+    // 皮肤与技能。★ 全部按**槽位**（不是按队）：coop 里左边两个人同队，但各有各的技能。
+    skins: [0, 0],            // 各槽位的皮肤（0 灰 / 1 青 / 2 黄 / 3 红）
+    skillCd: [0, 0],          // 各槽位技能冷却剩余秒数（0 = 可以放）
+    boostArmed: [0, 0],       // 各槽位"下次击球超高速"是否已经蓄好力
+    winds: [],                // 正在刮的风 [[dx, dy, 剩余秒], ...]（可以同时有多股）
+    phantom: [0, 0],          // 各队幻影球还剩几秒（只给释放方看，给的是"还在生效"的反馈）
+    solo: false,              // 对手是 AI
+    coop: false,              // 双人对抗 AI
+    botLevel: 1,
+    botName: '',
+    score: [0, 0],
+    present: [0, 0],
+    winner: -1,
+    serverTick: 0,
+    countdownMs: 0,
+
+    dir: 0,
+
+    rtt: 0,
+    rttSum: 0,
+    rttCount: 0,
+    snaps: 0,
+    lastSnapAt: 0,
+    intervals: [],
+    drops: 0,
+    lastTick: 0,
+    lastTickAt: 0,
+    tickRate: 0,
+    tkWinStart: 0,      // 频率统计窗口的起点时刻
+    tkWinBase: 0        // 窗口起点处的 tick 值
+  };
+
+  var sock = null;
+  var sentDir = -99;
+  var aiLevel = 1;            // AI 难度，默认"普通"；单人和双人两个 AI 模式共用
+  var touchTargetY = null;
+  var keys = { up: false, down: false };
+  var retryTimer = null;
+  var retryDelay = 800;
+  var closingByUs = false;
+
+  /** 切换模式：场地尺寸、拍子布局、本地预测要用的活动范围都得一起换 */
+  /**
+   * 把快照里的球数组贴进 view。
+   * ★ 三个必须做对的地方：
+   *   1) 新出现的 id（分裂出来的球）直接把平滑位置**初始化为服务端位置**，
+   *      不要从 (0,0) 或别的球的位置插值过来 —— 那会看到新球从角落飞过来。
+   *   2) 已经消失的 id 要同时清掉平滑位置和尾迹，否则尾迹会原地留一串鬼影，
+   *      而且 id 只增不减，存久了会一直涨。
+   *   3) 顺序按服务端给的来，渲染顺序就稳定了（球之间没有遮挡关系，纯为了确定性）。
+   */
+  function applyBallSnapshot(list) {
+    var incoming = list || [];
+    var seen = {};
+    var next = [];
+    for (var i = 0; i < incoming.length; i += 1) {
+      var b = incoming[i];                     // [id, x, y]
+      var id = b[0];
+      seen[id] = true;
+      next.push({ id: id, x: b[1], y: b[2] });
+      if (!view.ballDisps[id]) {
+        view.ballDisps[id] = { x: b[1], y: b[2] };
+        view.tails[id] = [];
+      }
+    }
+    view.balls = next;
+    for (var k in view.ballDisps) {
+      if (!seen[k]) { delete view.ballDisps[k]; delete view.tails[k]; }
+    }
+  }
+
+  function setMode(mode, wh) {
+    view.mode = mode || 'duel';
+    if (wh && wh.length === 2) { W = wh[0]; H = wh[1]; }
+    view.slots = slotsFor(view.mode, H);
+    view.coop = view.mode === 'coop';
+    view.solo = view.mode !== 'duel';
+    // 位置也要跟着重置。只调数组长度、留着上一局的残留位置的话，
+    // 换模式后的那一帧会把拍子画在错误的地方 —— 实测：从经典双人（两条都在 250）
+    // 切到 coop 时，下半场那条（span [400,800]，中点 600）会先出现在 250，
+    // 也就是**上半场里**。用各槽位 span 的中点，和服务端 createRoom 的做法保持一致。
+    view.paddles = view.slots.map(function (s) { return (s.span[0] + s.span[1]) / 2; });
+    view.paddleDisp = view.paddles.slice();
+    view.tails = {};
+    // ★ 技能相关的数组长度必须跟着**槽位数**走。经典双人是 2 个槽、coop 是 3 个，
+    //   数组留着上一局的长度会多出（或缺少）一个槽位，表现是"某个按钮一直显示冷却中"。
+    //   真实的皮肤值由下一帧快照带下来（服务端才是权威），这里先清成灰。
+    view.skins = view.slots.map(function () { return 0; });
+    view.skillCd = view.slots.map(function () { return 0; });
+    view.boostArmed = view.slots.map(function () { return 0; });
+    view.winds = [];
+    view.phantom = [0, 0];
+    // ★★ 必须**立刻**把画布尺寸同步过来。只改 W/H 而不重设 canvas 的话，会留下一帧
+    //   「场地已经是新模式的尺寸、画布还是旧的」的状态：
+    //     · 那 16ms 里画面比例是错的（coop 的 960×800 会被画进 800×500 的位图里）；
+    //     · 页面用来定场地比例的 CSS 变量 --ar 也跟着滞后一帧；
+    //     · 探针在这一帧读 canvasSize 会拿到旧值，和 court 对不上（实测踩到过）。
+    //   fitCanvas() 是幂等的（尺寸没变就不动 canvas），所以放在这里没有副作用。
+    fitCanvas();
+  }
+
+  // ================= 声音 =================
+  // 全部用 Web Audio 实时合成，不引任何音频文件。
+  // 理由：音效是"几十毫秒的短音"，用文件反而要处理加载时机和延迟，
+  //       合成是零加载、零额外资源、时间精确。
+  var audioCtx = null;
+  var soundOn = true;
+
+  function ac() {
+    if (!audioCtx) {
+      var Ctor = window.AudioContext || window.webkitAudioContext;
+      if (!Ctor) return null;
+      try { audioCtx = new Ctor(); } catch (e) { return null; }
+    }
+    if (audioCtx.state === 'suspended') {
+      var r = audioCtx.resume();
+      if (r && r.catch) r.catch(function () {});
+    }
+    return audioCtx;
+  }
+
+  /**
+   * 合成一声短音。
+   * 频率用指数滑音（exponentialRamp）而不是线性：听感上滑音才是均匀的。
+   * 包络两端都留 0.0001 而不是 0 —— 指数插值的目标值不能是 0，否则会抛错。
+   */
+  function blip(o) {
+    if (!soundOn) return;
+    var c = ac();
+    if (!c) return;
+    var t0 = c.currentTime + (o.delay || 0);
+    var dur = o.dur || 0.08;
+    var osc = c.createOscillator();
+    var g = c.createGain();
+    osc.type = o.type || 'square';
+    osc.frequency.setValueAtTime(o.freq, t0);
+    if (o.sweep) osc.frequency.exponentialRampToValueAtTime(o.sweep, t0 + dur);
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(o.gain || 0.12, t0 + 0.008);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    osc.connect(g);
+    g.connect(c.destination);
+    osc.start(t0);
+    osc.stop(t0 + dur + 0.03);
+  }
+
+  function sfxHit() {
+    // 每下略微变调，连打时不会像复读机
+    var f = 430 + Math.random() * 70;
+    blip({ freq: f, sweep: f * 0.55, type: 'square', dur: 0.055, gain: 0.075 });
+  }
+  function sfxScore() {
+    blip({ freq: 320, sweep: 170, type: 'triangle', dur: 0.16, gain: 0.13 });
+    blip({ freq: 210, sweep: 120, type: 'triangle', dur: 0.22, gain: 0.1, delay: 0.1 });
+  }
+  function sfxPower(mine) {
+    if (mine) {
+      blip({ freq: 540, sweep: 820, type: 'sine', dur: 0.09, gain: 0.11 });
+      blip({ freq: 820, sweep: 1180, type: 'sine', dur: 0.13, gain: 0.1, delay: 0.075 });
+    } else {
+      // 对手吃到道具：给一个低沉的提醒，别让人以为是自己拿到了
+      blip({ freq: 300, sweep: 220, type: 'sine', dur: 0.14, gain: 0.08 });
+    }
+  }
+  function sfxSave(mine) {
+    // 护盾救球：上滑的清脆音。必须和普通击球明显不同，
+    // 否则玩家分不清"我打到了球"和"我的护盾替我挡了一分"。
+    var f = mine ? 700 : 520;
+    blip({ freq: f, sweep: f * 1.8, type: 'sine', dur: 0.13, gain: 0.1 });
+  }
+  function sfxDouble(mine) {
+    // 双倍得分：两声短促上行，提示"这一分算了两分"
+    var f = mine ? 620 : 440;
+    blip({ freq: f, sweep: f, type: 'triangle', dur: 0.09, gain: 0.11 });
+    blip({ freq: f * 1.5, sweep: f * 1.5, type: 'triangle', dur: 0.12, gain: 0.11, delay: 0.08 });
+  }
+  /**
+   * 有人按了暂停 / 继续。
+   * ★ 两端都会响：对面按下暂停时你也该听得出来，否则你只会觉得"球怎么忽然不动了"。
+   *   暂停用下行音、继续用上行音，方向本身就把状态说清楚了。
+   */
+  function sfxPause(on) {
+    var f = on ? 520 : 380;
+    blip({ freq: f, sweep: on ? f * 0.6 : f * 1.7, type: 'sine', dur: 0.13, gain: 0.09 });
+  }
+  /**
+   * 有人放了技能。三种技能给三种音色，别人放的给一个低一号的版本 ——
+   * 和 sfxPower 一个道理：分不清"我放的"和"他放的"会让整个技能系统没有实感。
+   * @param {number} skin 皮肤编号（1 青 / 2 黄 / 3 红）
+   * @param {boolean} mine 是不是我放的
+   */
+  function sfxSkill(skin, mine) {
+    var lift = mine ? 1 : 0.72;
+    if (skin === 1) {
+      // 风：一片"呼"上来的气流声（低→高再回落，像一阵风掠过）
+      blip({ freq: 240 * lift, sweep: 700 * lift, type: 'sine', dur: 0.30, gain: 0.075 });
+      blip({ freq: 420 * lift, sweep: 300 * lift, type: 'sine', dur: 0.26, gain: 0.05, delay: 0.14 });
+    } else if (skin === 2) {
+      // 幻影：两下几乎重合的音，听感上就是"分裂"了
+      blip({ freq: 600 * lift, sweep: 900 * lift, type: 'triangle', dur: 0.10, gain: 0.10 });
+      blip({ freq: 615 * lift, sweep: 915 * lift, type: 'triangle', dur: 0.10, gain: 0.09, delay: 0.05 });
+    } else if (skin === 3) {
+      // 超高速：蓄力音，一串紧凑的上行
+      blip({ freq: 380 * lift, sweep: 1150 * lift, type: 'square', dur: 0.19, gain: 0.075 });
+    }
+  }
+  /** 超高速真的打出去了。必须和普通击球明显不同，否则玩家不知道那一板生效了 */
+  function sfxBoost(mine) {
+    var f = mine ? 900 : 660;
+    blip({ freq: f, sweep: f * 0.45, type: 'square', dur: 0.09, gain: 0.11 });
+  }
+  function sfxOver(won) {
+    if (won) {
+      blip({ freq: 520, sweep: 520, type: 'triangle', dur: 0.14, gain: 0.12 });
+      blip({ freq: 660, sweep: 660, type: 'triangle', dur: 0.14, gain: 0.12, delay: 0.13 });
+      blip({ freq: 880, sweep: 880, type: 'triangle', dur: 0.28, gain: 0.13, delay: 0.26 });
+    } else {
+      blip({ freq: 400, sweep: 380, type: 'triangle', dur: 0.18, gain: 0.1 });
+      blip({ freq: 280, sweep: 200, type: 'triangle', dur: 0.3, gain: 0.1, delay: 0.16 });
+    }
+  }
+
+  /** 服务端在快照里带下来的离散事件 → 对应音效 */
+  function playEvent(code) {
+    var kind = code.charAt(0);
+    if (kind === 'h') {
+      sfxHit();
+    } else if (kind === 'g') {
+      sfxScore();
+    } else if (kind === 'u') {
+      var who = Number(code.charAt(1));
+      sfxPower(who === view.mySide);
+    } else if (kind === 'k') {
+      sfxSave(Number(code.charAt(1)) === view.mySide);      // 护盾挡下一分
+    } else if (kind === 'x') {
+      sfxDouble(Number(code.charAt(1)) === view.mySide);    // 这一分是双倍
+    } else if (kind === 'o') {
+      sfxOver(Number(code.charAt(1)) === view.mySide);
+    } else if (kind === 'p') {
+      sfxPause(code.charAt(1) === 'p');     // pp = 暂停，pr = 继续
+    } else if (kind === 'v') {
+      // v + 槽位 + 皮肤：放技能
+      sfxSkill(Number(code.charAt(2)) || 0, Number(code.charAt(1)) === view.mySide);
+    } else if (kind === 'y') {
+      // y + 槽位：这一板是超高速
+      sfxBoost(Number(code.charAt(1)) === view.mySide);
+    }
+  }
+
+  // ---------- 背景音乐 ----------
+  // ★ 不用 base64 内嵌：这首 mp3 有 7MB，内嵌会让 HTML 涨到 10MB，
+  //   打开先愣几秒。放成独立文件用相对路径引，浏览器按 Range 分段取，边下边放。
+  var BGM_SRC = 'audio/bgm-ramble.mp3';
+  // base 是"目标音量"。用户反馈偏大，从 0.30 调到 0.24（约 −20%，听感上是小半档）。
+  var BGM = { el: null, base: 0.24, cur: 0, ready: false, failed: false };
+
+  function bgmInit() {
+    if (BGM.el) return;
+    var el = document.createElement('audio');
+    el.src = BGM_SRC;
+    el.loop = true;
+    el.preload = 'auto';
+    el.volume = 0;
+    el.addEventListener('canplaythrough', function () { BGM.ready = true; });
+    // 音乐加载失败绝不能影响游戏：只是没声音，比赛照常
+    el.addEventListener('error', function () { BGM.failed = true; BGM.ready = false; });
+    BGM.el = el;
+  }
+
+  /**
+   * 自动播放闸门。
+   * Chromium 在页面拿到用户手势之前不许出声，play() 返回的是被拒的 Promise
+   * （不抛异常，忘了 catch 就是一条 unhandled rejection）。
+   * 所以初始化时试一次是不够的 —— 必须挂到每次交互上重试。
+   * 内部先判 paused，挂在热路径上也只是一次属性读，不需要 once 标记。
+   */
+  function bgmArm() {
+    if (!soundOn) return;
+    bgmInit();
+    if (!BGM.el || !BGM.el.paused) return;
+    var p = BGM.el.play();
+    if (p && p.catch) p.catch(function () {});
+  }
+
+  window.addEventListener('pointerdown', bgmArm, true);   // capture：不被 stopPropagation 挡掉
+  window.addEventListener('keydown', bgmArm, true);
+  window.addEventListener('touchstart', bgmArm, true);
+
+  function bgmTarget() {
+    if (!soundOn || BGM.failed) return 0;
+    return BGM.base;
+  }
+
+  /** 音量状态机：由游戏状态算出目标，每帧让实际值逼近它。淡入/静音都走这一条路 */
+  function bgmTick(rdt) {
+    var el = BGM.el;
+    if (!el) return;
+
+    // ★ 没在播的时候音量必须恒为 0。被自动播放策略拦住的这段时间里如果照常推进，
+    //   cur 会悄悄爬到满值，用户第一次点击就是"啪"一下满音量起播，淡入等于白写。
+    if (el.paused) { BGM.cur = 0; el.volume = 0; return; }
+
+    var want = bgmTarget();
+    // 两档时间常数：还没爬到一半用慢档（这就是淡入），过半转快档收尾。
+    // 判据必须是相对量 —— 写成 cur < 0.02 这种固定小值，一超过就跳快档，等于没淡入。
+    var tau = (want > BGM.cur && BGM.cur < BGM.base * 0.5) ? 0.6 : 0.14;
+    BGM.cur += (want - BGM.cur) * (1 - Math.exp(-rdt / tau));
+    if (BGM.cur < 0.005) BGM.cur = 0;      // 指数逼近永远到不了 0，-46dB 直接钳零
+    el.volume = Math.min(1, Math.max(0, BGM.cur));
+  }
+
+  document.addEventListener('visibilitychange', function () {
+    if (!BGM.el) return;
+    if (document.hidden) BGM.el.pause();    // 切走就停：省电，也免得以为还在跑
+    else bgmArm();
+  });
+
+  function bgmSyncUI() {
+    var btn = document.getElementById('sfxBtn');
+    if (!btn) return;
+    btn.textContent = soundOn ? '🔊' : '🔇';
+    btn.className = 'soundbtn' + (soundOn ? '' : ' off');
+  }
+
+  function toggleSound() {
+    soundOn = !soundOn;
+    if (soundOn) bgmArm();
+    bgmSyncUI();
+  }
+
+  (function initSoundUI() {
+    var btn = document.getElementById('sfxBtn');
+    if (btn) btn.onclick = function () { toggleSound(); };
+    bgmSyncUI();
+  })();
+
+  // ---------- 会话（用于断线重连） ----------
+  // 用 sessionStorage 而不是 localStorage：座位属于「这个标签页」。
+  // 若用 localStorage，同一浏览器开第二个标签页试玩时会读到第一个的凭证，
+  // 拿着对方的身份去重连，把对方挤下线 —— 想在本地双开自测就直接中招。
+  // sessionStorage 每个标签页独立，刷新仍在，关掉即清。
+  var SESSION_KEY = 'pong-online-session-v1';
+
+  function saveSession(code, token, side) {
+    try {
+      sessionStorage.setItem(SESSION_KEY, JSON.stringify({ code: code, token: token, side: side }));
+    } catch (e) {}
+  }
+  function readSession() {
+    try {
+      var raw = sessionStorage.getItem(SESSION_KEY);
+      return raw ? JSON.parse(raw) : null;
+    } catch (e) { return null; }
+  }
+  function clearSession() {
+    try { sessionStorage.removeItem(SESSION_KEY); } catch (e) {}
+  }
+
+  // ---------- 画布尺寸 ----------
+  var dpr = 1;
+  var stage = document.querySelector('.stage');
+  function fitCanvas() {
+    var want = Math.min(window.devicePixelRatio || 1, 2);
+    dpr = want;
+    if (canvas.width !== W * dpr || canvas.height !== H * dpr) {
+      canvas.width = W * dpr;
+      canvas.height = H * dpr;
+    }
+    // 宽高比交给 CSS 变量：各模式的场地尺寸不同，写死 8/5 会把 coop 压扁
+    if (stage) stage.style.setProperty('--ar', (W / H).toFixed(4));
+  }
+
+  // ---------- 网络 ----------
+  function wsUrl() {
+    var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    return proto + '//' + location.host + '/ws';
+  }
+
+  function setBadge(text, cls) {
+    netBadge.textContent = text;
+    netBadge.className = 'badge' + (cls ? ' ' + cls : '');
+  }
+
+  // 连上之后该干什么，只在这里判断一次。
+  // 之前这段逻辑散在 onopen 和启动流程两处，会同时触发导致界面来回跳。
+  function onConnected() {
+    // 断线期间用户已经点了"建房 / 加入" → 以那个意图为准。
+    // 不能先自动坐回旧座位：那会连发两条 join，把房间搞乱。
+    if (flushPending()) return;
+
+    var s = readSession();
+
+    // 座位还在：优先坐回原位，比分和场上位置都能保住
+    if (s && s.code && s.token && (!pendingCode || pendingCode === s.code)) {
+      send({ t: 'rejoin', code: s.code, token: s.token });
+      return;
+    }
+
+    // 带着邀请码进来的：把菜单打开、把码替你填好，让**从链接进来的人也能选拍子**。
+    // ★ 以前这里是"直接 join"，代价是拿链接的人永远没有机会选皮肤 —— 而皮肤就是技能，
+    //   等于一半的玩家用不了这个功能。现在改成停在菜单上，多一次点击换每个人都能挑。
+    if (pendingCode) {
+      var code = pendingCode;
+      pendingCode = null;          // 用掉就清掉，防止重连时重复加入
+      clearSession();
+      showMenu(null, code);
+      return;
+    }
+
+    showMenu();
+  }
+
+  function connect() {
+    if (sock && (sock.readyState === 0 || sock.readyState === 1)) return;
+
+    setBadge('连接中…', 'warn');
+    var startedAt = performance.now();
+    var url = wsUrl();
+    view.wsUrl = url;
+
+    try {
+      sock = new WebSocket(url);
+    } catch (e) {
+      onDown('无法创建连接');
+      return;
+    }
+
+    sock.onopen = function () {
+      view.connected = true;
+      view.handshakeMs = Math.round(performance.now() - startedAt);
+      view.extensions = sock.extensions || '';
+      retryDelay = 800;
+      sentDir = -99;
+      setBadge('已连接', 'ok');
+      startPing();
+      onConnected();
+      renderMeters();
+    };
+
+    sock.onmessage = function (ev) {
+      var m;
+      try { m = JSON.parse(ev.data); } catch (e) { return; }
+      handleServer(m);
+    };
+
+    sock.onclose = function () {
+      if (closingByUs) { closingByUs = false; return; }
+      onDown('连接已断开');
+    };
+
+    sock.onerror = function () {
+      // 具体原因由 onclose 处理，这里不重复计数
+    };
+  }
+
+  function onDown(reason) {
+    view.connected = false;
+    view.drops += 1;
+    setBadge('已断线，重连中…', 'bad');
+    showDisconnected(reason);
+    renderMeters();
+
+    if (retryTimer) clearTimeout(retryTimer);
+    retryTimer = setTimeout(function () {
+      retryDelay = Math.min(retryDelay * 1.6, 5000);
+      connect();
+    }, retryDelay);
+  }
+
+  var pingTimer = null;
+  function startPing() {
+    if (pingTimer) clearInterval(pingTimer);
+    pingTimer = setInterval(function () {
+      if (sock && sock.readyState === 1) {
+        sock.send(JSON.stringify({ t: 'ping', ts: Math.round(performance.now()) }));
+      }
+    }, 2000);
+  }
+
+  // ---- 断线期间的"用户意图"要先攒着，不能丢 ----
+  // ★ 这里踩过一个完全不报错的坑：leaveRoom() 是"关连接 → 120ms 后再连"，
+  //   而 send() 在 socket 没 open 时是静默 return 的。用户点完「返回菜单」立刻
+  //   再点「人机对战」，create 就被丢掉了 —— 可按钮已经被它自己改成禁用的
+  //   "开局中…"。界面看着一切正常，实际永远进不去，只能刷新页面重来。
+  var pendingSends = [];
+  // 只有明确的用户意图值得补发。input / ping 是高频状态，补发出去的只会是过期数据
+  var QUEUEABLE = { create: 1, join: 1 };
+  var pendingTimer = null;
+
+  function send(obj) {
+    if (sock && sock.readyState === 1) { sock.send(JSON.stringify(obj)); return; }
+
+    if (!QUEUEABLE[obj.t]) return;
+    pendingSends.push(obj);
+
+    // 兜底：连接要是迟迟回不来，别让按钮一直卡在"开局中…"，把菜单还给用户
+    if (!pendingTimer) {
+      pendingTimer = setTimeout(function () {
+        pendingTimer = null;
+        if (!pendingSends.length) return;
+        pendingSends = [];
+        showMenu('刚才没连上，再点一次试试。');
+      }, 5000);
+    }
+  }
+
+  /** 连接就绪后补发攒下的意图；真发了东西就返回 true */
+  function flushPending() {
+    if (pendingTimer) { clearTimeout(pendingTimer); pendingTimer = null; }
+    if (!pendingSends.length) return false;
+    var q = pendingSends;
+    pendingSends = [];
+    for (var i = 0; i < q.length; i += 1) {
+      if (sock && sock.readyState === 1) sock.send(JSON.stringify(q[i]));
+    }
+    return true;
+  }
+
+  function handleServer(m) {
+    switch (m.t) {
+      case 'pong': {
+        var rtt = performance.now() - m.ts;
+        view.rtt = rtt;
+        view.rttSum += rtt;
+        view.rttCount += 1;
+        break;
+      }
+      case 'joined':
+      case 'rejoined': {
+        view.mySide = m.side;
+        view.code = m.code;
+        // 刚坐下一定是"还没开打"：把上一次对局残留的阶段与暂停状态清掉，
+        // 否则从一局里退出来再进新房时，那一瞬间按钮会按旧阶段的判断显示出来。
+        view.phase = 'waiting';
+        view.userPaused = false;
+        view.pausedBy = -1;
+        // 模式与场地尺寸在建房/入座时就定下来了，等第一帧快照会太晚 ——
+        // 等待面板上要写"等队友"还是"等对手"、画布多高，这里就得知道
+        setMode(m.mode || (m.solo ? 'solo' : 'duel'), m.wh);
+        if (typeof m.level === 'number' && m.level >= 0) view.botLevel = m.level;
+        view.botName = m.botName || (view.solo ? LEVEL_NAMES[view.botLevel] : '');
+        saveSession(m.code, m.token, m.side);   // 注意：token 仅存本机，不外传
+        syncSoloBar();
+        syncPauseBtn();
+        showWaiting();
+        renderMeters();
+        break;
+      }
+      case 'error': {
+        var msg = m.msg || '出错了';
+        if (msg.indexOf('座位') >= 0 || msg.indexOf('不存在') >= 0) clearSession();
+        // 加入失败时把刚才那个码填回去，省得用户重新敲
+        showMenu(msg, lastJoinCode);
+        lastJoinCode = null;
+        break;
+      }
+      case 'state': {
+        var now = performance.now();
+        if (view.lastSnapAt) {
+          var gap = now - view.lastSnapAt;
+          view.intervals.push(gap);
+          if (view.intervals.length > 90) view.intervals.shift();
+        }
+        view.lastSnapAt = now;
+        view.snaps += 1;
+
+        // 场地尺寸每帧随包下发。尺寸变了说明模式变了（例如刷新后重连进的是另一个模式），
+        // 这时要把整个布局换掉 —— 否则会拿旧场地的坐标去画新场地。
+        if (m.wh && (W !== m.wh[0] || H !== m.wh[1])) setMode(m.md || view.mode, m.wh);
+        else if (m.md && m.md !== view.mode) setMode(m.md, m.wh);
+
+        view.phase = m.ph;
+        // 真人主动暂停。★ 单独读，不从 ph 反推 —— 见 view.userPaused 的注释。
+        //   服务端下发的 up 已经是"真正生效"的那个值（第一局还没开始时按下的暂停不算数）。
+        view.userPaused = m.up === 1;
+        view.pausedBy = typeof m.pb === 'number' ? m.pb : -1;
+        syncPauseBtn();
+        applyBallSnapshot(m.bs);
+        view.paddles = m.p.slice();
+        view.score = m.s;
+        view.present = m.pr;
+        view.winner = m.wn;
+        view.countdownMs = m.cd || 0;
+        view.powerups = m.us || [];
+        view.curve = m.cv || 0;
+        if (m.pm) view.paddleMul = m.pm;
+        // 新增的状态：被冻、护盾层数、双倍得分
+        if (m.fz) view.freeze = m.fz;
+        if (m.sh) view.shield = m.sh;
+        if (m.db) view.double = m.db;
+        // 隐形球的剩余秒数（做提示）与观看透明度（做渲染）。
+        // ★ 两个字段都要：iv 是给"还剩多久"这句话用的，ia 才是画球用的。
+        //   只用 ia 的话，渐变两端（1→0 刚起步、0→1 快到 1）判不出"到底在不在隐形"，
+        //   提示语会一闪一闪。只用 iv 的话，渐变曲线就得在客户端再实现一遍。
+        if (m.iv) view.invis = m.iv;
+        if (m.ia) view.invisAlpha = m.ia;
+        // 皮肤与技能。全部以服务端为准（客户端一个字节都不猜）。
+        //   sk 是**每个槽位**的皮肤，不只自己那个 —— 拍子颜色要靠它画。
+        if (m.sk && m.sk.length) view.skins = m.sk;
+        if (m.sc) view.skillCd = m.sc;
+        if (m.bo) view.boostArmed = m.bo;
+        view.winds = m.wf || [];       // 风没了就该立刻停，所以这里不用 || 保留旧值
+        if (m.px) view.phantom = m.px;
+        syncSkillBtns();
+
+        // 事件是"这一批快照里发生的事"，服务端发完即清。
+        // 主循环一轮可能推进多个 tick 才广播一次，所以这里可能一次收到多个事件。
+        if (m.ev && m.ev.length) {
+          for (var ei = 0; ei < m.ev.length; ei += 1) playEvent(m.ev[ei]);
+        }
+
+        if (m.k !== view.lastTick) {
+          var t = performance.now();
+          // ★ 用固定时间窗求平均，而不是逐次差分。
+          //   主循环为了对齐固定步长，偶尔会在一轮里补两个 tick（Δk=2 而 Δt 只有 33ms），
+          //   逐次差分会被这一下瞬间拉到 50~60 —— 面板上的数字乱跳，看着像服务端跑飞了，
+          //   其实服务端一直稳稳地 30Hz。窗口法把这种抖动平均掉。
+          if (!view.tkWinStart) {
+            view.tkWinStart = t;
+            view.tkWinBase = m.k;
+          } else if (t - view.tkWinStart >= 2000) {
+            var span = (t - view.tkWinStart) / 1000;
+            var dk = m.k - view.tkWinBase;
+            // 防除零 + 防污染：span 为 0 会算出 Infinity，
+            // 而 Infinity 乘 0.7 仍然是 Infinity，一旦写进去就永远收敛不回来。
+            if (span > 0.5 && dk > 0) {
+              var rate = dk / span;
+              if (isFinite(rate) && rate > 0) {
+                view.tickRate = view.tickRate ? view.tickRate * 0.7 + rate * 0.3 : rate;
+              }
+            }
+            view.tkWinStart = t;
+            view.tkWinBase = m.k;
+          }
+          view.lastTickAt = t;
+          view.lastTick = m.k;
+        }
+
+        // 所有座位都在场就把覆盖层撤掉，把场地让出来。
+        // ★ coop 有三个座位（两个真人 + AI），要三个都到齐才算"人齐了" ——
+        //   写成 present[0] && present[1] 会让第二个真人还没进来时就开局。
+        if (view.mySide >= 0 && view.present.length === view.slots.length
+            && view.present.every(function (v) { return v === 1; })) {
+          if (!overlay.classList.contains('hidden')) hideOverlay();
+        }
+        break;
+      }
+      default: break;
+    }
+  }
+
+  // ---------- 输入 ----------
+  function setDir(d) {
+    if (d !== -1 && d !== 0 && d !== 1) d = 0;
+    view.dir = d;
+    if (d !== sentDir) {
+      sentDir = d;
+      send({ t: 'input', dir: d });
+    }
+  }
+
+  function dirFromKeys() {
+    var d = 0;
+    if (keys.up) d -= 1;
+    if (keys.down) d += 1;
+    return d;
+  }
+
+  /**
+   * 上报一次「暂停 / 继续」。按钮和 P 键都走这里，语义只有一条：
+   * **按一下算一下**，切换成什么状态由服务端决定（快照里的 up / pb 才是真值）。
+   * 没入座、或者比赛还没跑起来（waiting）时不发 —— 与按钮的显示条件、以及服务端
+   * 那句 `room.started &&` 前提保持一致。
+   */
+  function requestPause() {
+    if (view.mySide < 0 || view.phase === 'waiting') return;
+    send({ t: 'pause' });
+  }
+
+  /**
+   * 上报一次「放技能」。按钮、Q 键、手机点按都走这里。
+   *
+   * ★ 这里的两道前置检查（有没有技能、在不在冷却）**只是省一次白跑的往返**，
+   *   真正的门禁全在服务端（castSkill）。所以它们算错也只会多/少发一条消息，
+   *   不会让"放不出来"或者"放出来两次"这种真问题溜过去。
+   * ★ 不做任何乐观更新：按钮上的字和冷却环一律等快照回来再变，
+   *   和暂停按钮同一个理由 —— 两个人同时按的时候，乐观看的状态和真值会分叉。
+   */
+  function requestSkill() {
+    // 服务端的门禁是"必须 playing"，这里跟着一起挡 —— 倒计时/结束期间按下去
+    // 只会白跑一趟，按钮却会闪一下像放出去了
+    if (view.mySide < 0 || view.phase !== 'playing') return;
+    var skin = view.skins[view.mySide];
+    if (!(skin > 0)) return;                                  // 灰板子没有技能
+    if ((view.skillCd[view.mySide] || 0) > 0.05) return;       // 冷却中
+    send({ t: 'skill' });
+  }
+
+  function onKey(e, down) {
+    var k = e.key;
+    // ★ 正在输入框里打字时，任何单键快捷键都不该生效。房间码输入框是真实存在的：
+    //   在里头敲房间码时按到 m / p，会被当成"静音 / 暂停"——静音那条是本来就有的毛病，
+    //   顺手一起挡住。（Enter 提交房间码由输入框自己的 onkeydown 管，不经过这里。）
+    var tg = e.target;
+    if (tg && (tg.tagName === 'INPUT' || tg.tagName === 'TEXTAREA' || tg.isContentEditable)) return;
+    // 静音键放在最前面：否则开局的覆盖层会把后面的分支顺序影响掉
+    if (down && (k === 'm' || k === 'M')) { toggleSound(); return; }
+    // 暂停快捷键。和点按钮走同一条路（只上报意图，界面状态等服务端回话）
+    if (down && (k === 'p' || k === 'P')) { requestPause(); return; }
+    // 技能快捷键（电脑端）。手机端靠点那个按钮，不走键盘。
+    if (down && (k === 'q' || k === 'Q')) { requestSkill(); return; }
+    var isUp = (k === 'ArrowUp' || k === 'w' || k === 'W');
+    var isDown = (k === 'ArrowDown' || k === 's' || k === 'S');
+    if (!isUp && !isDown) return;
+    e.preventDefault();
+    if (isUp) keys.up = down;
+    if (isDown) keys.down = down;
+    touchTargetY = null;
+    if (view.mySide >= 0) setDir(dirFromKeys());
+  }
+
+  window.addEventListener('keydown', function (e) { onKey(e, true); });
+  window.addEventListener('keyup', function (e) { onKey(e, false); });
+  window.addEventListener('blur', function () {
+    keys.up = false; keys.down = false;
+    setDir(0);
+  });
+
+  // ---------- 触屏 ----------
+  // ★ 绑在 window 上而不是 canvas 上。原因有两个，都是手机上真会遇到的事：
+  //   1. 手机横屏时球场两侧各有一段留白（球场固定 1.6，屏幕普遍更宽），
+  //      拇指落在**自己拍子左边**那片留白里时，以前完全没有反应；
+  //   2. 手正压在拍子上拨，手掌就把球挡掉一半。
+  //   现在整屏任何位置按下都能拖，玩家可以把手指挪到旁边不碍事的地方。
+  //   只排除真正的点击目标（按钮 / 菜单 / 常驻栏 / 横屏提示），免得把点击抢成拖动。
+  var touchActive = false;
+
+  function touchHitsUI(target) {
+    return !!(target && target.closest
+      && target.closest('button, a, input, select, textarea, .overlay, .panelbox, .solobar, .rotatetip'));
+  }
+
+  function touchY(ev) {
+    var t = ev.touches && ev.touches[0];
+    if (!t) return null;
+    var rect = canvas.getBoundingClientRect();
+    if (!rect.height) return null;
+    // 落点允许高于/低于球场：夹到 [0, H]，等价于把拍子推到顶/底。
+    // 不夹的话在竖屏（画布上下留白很大）会算出一个离谱的目标值。
+    var y = (t.clientY - rect.top) / rect.height * H;
+    if (!isFinite(y)) return null;
+    return Math.max(0, Math.min(H, y));
+  }
+
+  function onTouchStart(e) {
+    if (view.mySide < 0) return;
+    if (touchHitsUI(e.target)) return;
+    var y = touchY(e);
+    if (y === null) return;
+    touchActive = true;
+    touchTargetY = y;
+    e.preventDefault();
+  }
+
+  function onTouchMove(e) {
+    if (!touchActive) return;
+    if (view.mySide < 0) { touchActive = false; return; }
+    var y = touchY(e);
+    if (y === null) return;
+    touchTargetY = y;
+    e.preventDefault();
+  }
+
+  function onTouchEnd(e) {
+    if (!touchActive) return;
+    touchActive = false;
+    touchTargetY = null;
+    setDir(0);
+    if (e && e.cancelable) e.preventDefault();
+  }
+
+  window.addEventListener('touchstart', onTouchStart, { passive: false });
+  window.addEventListener('touchmove', onTouchMove, { passive: false });
+  window.addEventListener('touchend', onTouchEnd);
+  window.addEventListener('touchcancel', onTouchEnd);
+
+  // ---------- 界面切换 ----------
+  function showMenu(errMsg, prefill) {
+    overlay.classList.remove('hidden');
+    overlayBody.innerHTML = '';
+    var h = document.createElement('h2');
+    h.textContent = '双人实时对战';
+    var p = document.createElement('p');
+    // 带着邀请码进来时把话说清楚：码已经替你填好了，选完拍子点「加入」就行。
+    // ★ 这一段是有意为之 —— 从链接进来的人也要能选拍子，所以不再"打开链接就自动进房"。
+    p.textContent = errMsg
+      ? errMsg
+      : (prefill
+        ? '已为你填好房间码 ' + prefill + '。选好拍子，点「加入」就能进。'
+        : '创建房间拿到一个码，把链接发给朋友，两边就能实时打。');
+
+    // ---- 拍子皮肤（颜色 = 技能） ----
+    var skinLabel = document.createElement('div');
+    skinLabel.className = 'seglabel';
+    skinLabel.textContent = '我的拍子（颜色 = 技能）';
+    var skinRow = document.createElement('div');
+    skinRow.className = 'skinrow';
+    var swatches = [];
+    for (var si = 0; si < SKIN_NAMES.length; si += 1) {
+      (function (idx) {
+        var b = document.createElement('button');
+        b.className = 'swatch' + (idx === mySkin ? ' on' : '');
+        b.appendChild(document.createElement('i'));
+        b.appendChild(document.createTextNode(SKIN_NAMES[idx]));
+        b.title = SKIN_DESC[idx];
+        b.onclick = function () {
+          mySkin = idx;
+          saveSkin(idx);
+          for (var q = 0; q < swatches.length; q += 1) {
+            swatches[q].className = 'swatch' + (q === idx ? ' on' : '');
+          }
+        };
+        swatches.push(b);
+        skinRow.appendChild(b);
+      })(si);
+    }
+    // 色块里的那根小竖条用真实的皮肤色画出来 —— 光写"青/黄/红"看不出到底什么颜色
+    var chips = skinRow.querySelectorAll('i');
+    for (var ci = 0; ci < chips.length; ci += 1) chips[ci].style.background = SKIN_COL[ci];
+
+    var skinHint = document.createElement('div');
+    skinHint.className = 'hint';
+    skinHint.textContent = '灰 = 没有技能；青 = 一阵风；黄 = 幻影球；红 = 下次击球超高速。'
+      + '（AI 不能选。）';
+    skinHint.style.marginTop = '6px';
+
+    var createBtn = document.createElement('button');
+    createBtn.className = 'primary';
+    createBtn.textContent = '创建房间';
+    createBtn.onclick = function () {
+      createBtn.disabled = true;
+      createBtn.textContent = '创建中…';
+      clearSession();
+      send({ t: 'create', skin: mySkin });
+    };
+
+    var row = document.createElement('div');
+    row.className = 'joinrow';
+    var input = document.createElement('input');
+    input.type = 'text';
+    input.maxLength = 6;
+    input.placeholder = '房间码';
+    input.value = prefill || '';
+    input.oninput = function () {
+      input.value = input.value.replace(/[^A-Za-z0-9]/g, '').toUpperCase();
+    };
+    input.onkeydown = function (e) { if (e.key === 'Enter') joinBtn.click(); };
+
+    var joinBtn = document.createElement('button');
+    joinBtn.className = prefill ? 'primary' : 'ghost';
+    if (prefill) joinBtn.style.width = 'auto';
+    joinBtn.textContent = '加入';
+    joinBtn.onclick = function () {
+      var c = (input.value || '').trim().toUpperCase();
+      if (c.length !== 6) { p.textContent = '房间码是 6 位，检查一下。'; return; }
+      joinBtn.disabled = true;
+      joinBtn.textContent = '加入中…';
+      lastJoinCode = c;
+      clearSession();
+      send({ t: 'join', code: c, skin: mySkin });
+    };
+
+    row.appendChild(input);
+    row.appendChild(joinBtn);
+
+    // ---- 打 AI：单人和双人两个入口，共用同一档难度 ----
+    var divider = document.createElement('div');
+    divider.className = 'divider';
+    divider.textContent = '或者';
+
+    var segLabel = document.createElement('div');
+    segLabel.className = 'seglabel';
+    segLabel.textContent = 'AI 难度';
+
+    var seg = document.createElement('div');
+    seg.className = 'segrow';
+    var segBtns = [];
+    for (var li = 0; li < LEVEL_NAMES.length; li += 1) {
+      (function (lv) {
+        var b = document.createElement('button');
+        b.className = 'seg' + (lv === aiLevel ? ' on' : '');
+        b.textContent = LEVEL_NAMES[lv];
+        b.onclick = function () {
+          aiLevel = lv;
+          for (var q = 0; q < segBtns.length; q += 1) {
+            segBtns[q].className = 'seg' + (q === lv ? ' on' : '');
+          }
+        };
+        segBtns.push(b);
+        seg.appendChild(b);
+      })(li);
+    }
+
+    var aiRow = document.createElement('div');
+    aiRow.className = 'duorow';
+
+    var soloBtn = document.createElement('button');
+    soloBtn.className = 'ghost';
+    soloBtn.textContent = '单人打 AI';
+    soloBtn.onclick = function () {
+      soloBtn.disabled = true;
+      soloBtn.textContent = '开局中…';
+      clearSession();
+      send({ t: 'create', mode: 'solo', level: aiLevel, skin: mySkin });
+    };
+
+    var coopBtn = document.createElement('button');
+    coopBtn.className = 'ghost';
+    coopBtn.textContent = '双人打 AI';
+    coopBtn.onclick = function () {
+      coopBtn.disabled = true;
+      coopBtn.textContent = '开局中…';
+      clearSession();
+      send({ t: 'create', mode: 'coop', level: aiLevel, skin: mySkin });
+    };
+
+    aiRow.appendChild(soloBtn);
+    aiRow.appendChild(coopBtn);
+
+    overlayBody.appendChild(h);
+    overlayBody.appendChild(p);
+    overlayBody.appendChild(skinLabel);
+    overlayBody.appendChild(skinRow);
+    overlayBody.appendChild(skinHint);
+    overlayBody.appendChild(createBtn);
+    overlayBody.appendChild(row);
+    overlayBody.appendChild(divider);
+    overlayBody.appendChild(segLabel);
+    overlayBody.appendChild(seg);
+    overlayBody.appendChild(aiRow);
+
+    var hint = document.createElement('div');
+    hint.className = 'hint';
+    hint.textContent = '「双人打 AI」是两个人各守球台的一半，一起对付右边更快的 AI ——'
+      + '开好房把链接发给朋友就行。同一个房间最多两个人。';
+    overlayBody.appendChild(hint);
+  }
+
+  /**
+   * 暂停按钮。只在「已经坐下 且 阶段不是 waiting」时出现 —— waiting 既包括
+   * "对手还没进来"，也包括"缺人自动冻结"，那两种情况下比赛本来就没在跑，
+   * 摆一个暂停按钮只会让人以为按了会有什么变化。
+   *
+   * ★ 标签一律以**服务端快照**为准，绝不乐观翻转：按下之后到下一帧快照之间
+   *   若又按了一下（两个人同时按就会这样），乐观看的状态立刻和真实状态分叉，
+   *   而分叉之后按钮上写的字恰好是反的 —— 那比慢 30ms 难受得多。
+   */
+  function syncPauseBtn() {
+    if (!pauseBtn) return;
+    var show = view.mySide >= 0 && view.phase !== 'waiting';
+    pauseBtn.style.display = show ? '' : 'none';
+    var p = show && !!view.userPaused;
+    var want = p ? '继续' : '暂停';
+    if (pauseBtn.textContent !== want) pauseBtn.textContent = want;
+    var cls = 'soundbtn' + (p ? ' active' : '');
+    if (pauseBtn.className !== cls) pauseBtn.className = cls;
+  }
+
+  /**
+   * 技能按钮的显隐与内容。每个**有技能**的槽位一个，位置由 layoutSkillBtns 每帧算。
+   *
+   * ★ 别人的按钮只当仪表盘：看得见队友/对手的技能好没好，但点不动
+   *   （`.foreign` 上了 pointer-events:none）。需求要的是"每个拍子边上都有自己的技能"，
+   *   把这个布局摆出来才算数；同时又不该让人误以为能替对面按。
+   * ★ AI 是灰板子，所以 coop 里第三个槽位不会冒出按钮来。
+   */
+  function syncSkillBtns() {
+    for (var i = 0; i < skillBtnEls.length; i += 1) {
+      var el = skillBtnEls[i];
+      if (!el) continue;
+      var skin = view.skins[i];
+      // ★ 条件里的 `phase !== 'waiting'` 不能省：等待面板是盖在球场上的整块遮罩，
+      //   而技能按钮是 position:fixed + z-index:5 —— 不收起来的话它会浮在菜单上面。
+      //   这也和暂停按钮的显示条件一致（都只在"比赛真的在跑"的时候出现）。
+      var has = view.mySide >= 0 && view.phase !== 'waiting'
+        && i < view.slots.length && typeof skin === 'number' && skin > 0;
+      el.style.display = has ? 'flex' : 'none';
+      if (!has) continue;
+
+      var mine = i === view.mySide;
+      var live = view.phase === 'playing';       // 只有 playing 期间技能才真的放得出去
+      var cd = view.skillCd[i] || 0;
+      // 0.05s 的容差：服务端下发的是四舍五入到 0.1 的小数，正好卡在 0 附近时
+      // 用严格 > 0 判断会让按钮在"就绪/冷却"之间闪一下。
+      var cooling = cd > 0.05;
+      var ready = cd <= 0.05 && (mine ? live : true);
+      var txt = cooling ? String(Math.ceil(cd)) : SKIN_GLYPH[skin];
+      if (el.textContent !== txt) el.textContent = txt;
+      var total = SKIN_CD_S[skin] || 1;
+      el.style.setProperty('--p', (cooling ? Math.min(1, cd / total) : 0).toFixed(3));
+      el.style.color = ready ? SKIN_COL[skin] : '#7c8aa5';
+      el.title = SKIN_NAMES[skin] + ' · ' + SKIN_DESC[skin]
+        + (mine ? '（电脑上也能按 Q）' : '（对手的技能）');
+      var cls = 'skillbtn' + (mine ? (ready ? ' ready' : '') : ' foreign');
+      if (el.className !== cls) el.className = cls;
+    }
+    // ★ 摆完位置要立刻算一次，不能只等 loop 里的那一帧：
+    //   rAF 在**后台标签页**会被浏览器暂停（实测：另一个标签页被打开后，
+    //   本页的按钮全部停在 left:0/top:0，因为 layoutSkillBtns 一帧都没跑）。
+    //   快照是 WebSocket 推的，后台照样到，所以挂在这里能让位置与"页面在不在前台"无关。
+    layoutSkillBtns();
+  }
+
+  /**
+   * 把技能按钮摆到自己那条拍子的**外侧**（球场之外），纵向跟着拍子走。
+   *
+   * ★ 为什么放在球场外而不是球场里：球场内每一寸都是有效区域，按钮压在上面既挡球
+   *   又挡视线。放在外侧还有个好处 —— 它天然落在"自己这一侧"，谁是哪个按钮一目了然。
+   * ★ 窗口太窄、外侧放不下时退回到球场内侧贴边（见下面两句兜底），
+   *   宁可压一点点球场也不能让按钮跑出屏幕（那样就彻底点不到了）。
+   */
+  function layoutSkillBtns() {
+    if (view.mySide < 0) return;
+    var r = canvas.getBoundingClientRect();
+    if (!r.width || !r.height) return;
+    var sy = r.height / H;
+    var size = 38;
+    var half = size / 2;
+    var vh = window.innerHeight;
+    for (var i = 0; i < skillBtnEls.length; i += 1) {
+      var el = skillBtnEls[i];
+      if (!el || el.style.display === 'none') continue;
+      var sl = view.slots[i];
+      if (!sl) continue;
+      var cy = r.top + view.paddleDisp[i] * sy;
+      // 纵向：跟着拍子，但整颗按钮都要留在视口里
+      var y = Math.max(4, Math.min(vh - size - 4, cy - half));
+      // 横向：贴着自己那条边的外侧
+      var cx = sl.edge === 'left' ? r.left - half - 8 : r.right + half + 8;
+      if (cx - half < 4) cx = r.left + half + 6;                       // 外侧塞不下 → 场内贴边
+      if (cx + half > window.innerWidth - 4) cx = r.right - half - 6;
+      var x = Math.round(Math.max(2, Math.min(window.innerWidth - size - 2, cx - half)));
+      var key = x + ',' + Math.round(y);
+      if (el.__xy !== key) {
+        el.__xy = key;
+        el.style.left = x + 'px';
+        el.style.top = Math.round(y) + 'px';
+      }
+    }
+  }
+
+  (function initSkillBtns() {
+    for (var i = 0; i < skillBtnEls.length; i += 1) {
+      (function (idx) {
+        var el = skillBtnEls[idx];
+        if (!el) return;
+        el.onclick = function () {
+          // 别人的按钮本来就点不到（pointer-events:none），这里再挡一道，
+          // 免得以后有人手滑把那条 CSS 去掉就变成"能替对面放技能"。
+          if (idx !== view.mySide) return;
+          requestSkill();
+        };
+      })(i);
+    }
+    syncSkillBtns();
+  })();
+
+  /** AI 模式的常驻栏。这两个模式下画布上不会再有遮罩，退出入口得挂在这里 */
+  function syncSoloBar() {
+    var bar = document.getElementById('soloBar');
+    var txt = document.getElementById('soloText');
+    var lab = document.getElementById('soloLabel');
+    if (!bar) return;
+    if (view.solo && view.mySide >= 0) {
+      bar.style.display = 'flex';
+      // coop 里还得告诉每个人"你守哪半场"，否则两个人不知道自己该管哪一块
+      var mine = view.coop ? (view.mySide === 0 ? '你守上半场 · ' : '你守下半场 · ') : '对手 ';
+      if (txt && txt.childNodes[0]) txt.childNodes[0].nodeValue = mine;
+      if (lab) lab.textContent = 'AI · ' + (view.botName || LEVEL_NAMES[view.botLevel] || '普通');
+    } else {
+      bar.style.display = 'none';
+    }
+  }
+
+  (function initSoloBar() {
+    var btn = document.getElementById('soloLeave');
+    if (btn) btn.onclick = function () { leaveRoom(); };
+  })();
+
+  (function initPauseBtn() {
+    if (!pauseBtn) return;
+    // 只上报"我按了一下"，具体切到什么状态以服务端快照为准。
+    // 也正因为这样，这里不需要 disabled / 防连点 —— 连点两次就是切两次，
+    // 而需求正是"每个人点都会生效"。
+    pauseBtn.onclick = function () { requestPause(); };
+    syncPauseBtn();
+  })();
+
+  /** 退出当前房间回到菜单。人机和双人两条路都走这里，避免两套逻辑跑偏 */
+  function leaveRoom() {
+    clearSession();
+    closingByUs = true;
+    try { if (sock) sock.close(); } catch (e) {}
+    view.mySide = -1;
+    view.code = '';
+    view.solo = false;
+    view.coop = false;
+    view.phase = 'waiting';
+    view.userPaused = false;
+    view.pausedBy = -1;
+    // 技能按钮/冷却也要清干净：不清的话退出房间那一瞬间，球场上还挂着上一个人的
+    // 技能按钮（它挂在 .wrap 上、不随遮罩一起消失）
+    view.skins = [0, 0];
+    view.skillCd = [0, 0];
+    view.boostArmed = [0, 0];
+    view.winds = [];
+    view.phantom = [0, 0];
+    syncSoloBar();
+    syncPauseBtn();
+    syncSkillBtns();
+    // 断开后重新连一次，拿一个干净的新连接再建房
+    setTimeout(connect, 120);
+    showMenu();
+  }
+
+  function showWaiting() {
+    overlay.classList.remove('hidden');
+    overlayBody.innerHTML = '';
+
+    var h = document.createElement('h2');
+    h.textContent = view.coop ? '双人打 AI' : (view.solo ? '单人打 AI' : '房间已就绪');
+
+    // 单人打 AI 没有队友要邀请，所以不显示房间码和邀请链接 ——
+    // 摆一个没人会用的邀请链接只会让人以为还要再找个人才能开始。
+    // 这个面板其实只会闪一下（AI 永远"在场"，第一帧快照就把遮罩撤了），
+    // 常驻的退出入口在画布下方的 soloBar。
+    if (view.solo && !view.coop) {
+      var sp = document.createElement('p');
+      sp.innerHTML = '对手：<b>AI · ' + (view.botName || LEVEL_NAMES[view.botLevel] || '普通')
+        + '</b><br>倒计时结束后自动开球，先到 11 分赢。';
+      overlayBody.appendChild(h);
+      overlayBody.appendChild(sp);
+      return;
+    }
+
+    var code = document.createElement('div');
+    code.className = 'code';
+    code.textContent = view.code;
+
+    // coop 要等的是队友（他会坐进下半场），不是对手 —— 文案说清这个差别
+    var p = document.createElement('p');
+    p.innerHTML = view.coop
+      ? '把下面这个链接发给队友，他打开后选好拍子、点「加入」，坐在<b>下半场</b>。<br>两个人都到齐后比赛自动开始。'
+      : '把下面这个链接发给朋友，他打开后选好拍子、点「加入」就能进来。<br>两个人都进来后比赛自动开始。';
+
+    var copyBtn = document.createElement('button');
+    copyBtn.className = 'primary';
+    copyBtn.textContent = '复制邀请链接';
+    copyBtn.onclick = function () {
+      var link = location.origin + location.pathname + '?room=' + view.code;
+      var done = function () {
+        copyBtn.textContent = '已复制 ✓';
+        setTimeout(function () { copyBtn.textContent = '复制邀请链接'; }, 1600);
+      };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(link).then(done, function () { fallbackCopy(link, done); });
+      } else {
+        fallbackCopy(link, done);
+      }
+    };
+
+    var stat = document.createElement('p');
+    stat.style.marginTop = '14px';
+    stat.innerHTML = '<span class="waitdot">●</span> '
+      + (view.coop ? '等待队友加入…' : '等待对手加入…');
+    stat.id = 'waitStat';
+
+    var row = document.createElement('div');
+    row.className = 'joinrow';
+    var leave = document.createElement('button');
+    leave.className = 'ghost';
+    leave.style.width = '100%';
+    leave.textContent = '离开房间';
+    leave.onclick = function () { leaveRoom(); };
+    row.appendChild(leave);
+
+    overlayBody.appendChild(h);
+    overlayBody.appendChild(code);
+    overlayBody.appendChild(p);
+    overlayBody.appendChild(copyBtn);
+    overlayBody.appendChild(stat);
+    overlayBody.appendChild(row);
+  }
+
+  function fallbackCopy(text, done) {
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand('copy'); done(); } catch (e) {}
+    document.body.removeChild(ta);
+  }
+
+  function showDisconnected(reason) {
+    if (view.mySide < 0) {
+      overlay.classList.remove('hidden');
+      overlayBody.innerHTML = '';
+      var h = document.createElement('h2');
+      h.textContent = '连接中断';
+      var p = document.createElement('p');
+      p.textContent = reason + '，正在自动重连。你的座位会保留一会儿。';
+      overlayBody.appendChild(h);
+      overlayBody.appendChild(p);
+    }
+  }
+
+  function hideOverlay() {
+    overlay.classList.add('hidden');
+  }
+
+  // ---------- 调试面板 ----------
+  var elTransport = document.getElementById('mTransport');
+  var elRtt = document.getElementById('mRtt');
+  var elRate = document.getElementById('mRate');
+  var elTickRate = document.getElementById('mTickRate');
+  var elSnaps = document.getElementById('mSnaps');
+  var elDrops = document.getElementById('mDrops');
+  var elVerdict = document.getElementById('verdict');
+  // 手机端顶部的延迟胶囊。桌面端它是 display:none，更新它没有任何副作用。
+  var pingPill = document.getElementById('pingPill');
+
+  function renderMeters() {
+    if (!view.connected) {
+      elTransport.textContent = '—';
+    } else if (view.mySide < 0) {
+      elTransport.textContent = 'WebSocket ✓';
+    } else {
+      elTransport.textContent = 'WebSocket ✓';
+    }
+
+    elRtt.textContent = view.rttCount ? Math.round(view.rtt) + ' ms' : '—';
+
+    // 手机端只保留这一个数：延迟。阈值按"还能不能正常玩"定，
+    // 不按"好看"定 —— 80ms 以内基本无感，180ms 以上接球已经得靠预判了。
+    if (pingPill) {
+      if (view.rttCount) {
+        var msR = Math.round(view.rtt);
+        pingPill.textContent = msR + ' ms';
+        pingPill.className = 'badge ping ' + (msR < 80 ? 'ok' : (msR < 180 ? 'warn' : 'bad'));
+      } else {
+        pingPill.textContent = '—';
+        pingPill.className = 'badge ping';
+      }
+    }
+
+    elDrops.textContent = String(view.drops);
+    elSnaps.textContent = String(view.snaps);
+
+    if (view.intervals.length > 12) {
+      var sum = 0;
+      for (var i = 0; i < view.intervals.length; i++) sum += view.intervals[i];
+      var avg = sum / view.intervals.length;
+      elRate.innerHTML = (1000 / avg).toFixed(1) + '<small>/秒</small>';
+    } else {
+      elRate.textContent = '—';
+    }
+
+    elTickRate.innerHTML = view.tickRate
+      ? view.tickRate.toFixed(1) + '<small>次/秒</small>'
+      : '—';
+
+    // 结论：只有在真的收到足够快照后才下判断
+    if (!view.connected) {
+      elVerdict.textContent = '当前未连接。';
+    } else if (view.snaps < 10) {
+      elVerdict.textContent = '长连接已建立，正在采集数据…';
+    } else if (view.drops === 0 && view.intervals.length > 12) {
+      var s = 0;
+      for (var j = 0; j < view.intervals.length; j++) s += view.intervals[j];
+      var a = 1000 / (s / view.intervals.length);
+      elVerdict.innerHTML = '<b>长连接可用。</b>连接方式是原生 WebSocket，没有降级到轮询，'
+        + '说明发布环境放行了升级握手。服务器每秒稳定推 ' + a.toFixed(1) + ' 次状态，'
+        + '往返延迟 ' + Math.round(view.rtt) + ' 毫秒，期间没有掉线。';
+    } else if (view.drops > 0) {
+      elVerdict.innerHTML = '<b>连接可用但不够稳。</b>已经掉线 ' + view.drops
+        + ' 次，自动重连生效了。如果是一玩就断，多半是中间的代理在回收空闲连接。';
+    }
+  }
+
+  // ---------- 探针钩子 ----------
+  // 给自动化测试读取内部状态用，正常玩不受影响
+  window.__probe = function () {
+    return {
+      connected: view.connected,
+      mySide: view.mySide,
+      code: view.code,
+      phase: view.phase,
+      score: view.score.slice(),
+      snaps: view.snaps,
+      rtt: Math.round(view.rtt),
+      drops: view.drops,
+      samples: view.intervals.length,
+      tickRate: Math.round(view.tickRate * 10) / 10,
+      tickRaw: view.tickRate,     // 未取整的原始值：出问题时一眼能分辨"还没算出来"还是"被污染"
+      paddle: view.paddles.slice(),
+      // 本地预测位置。服务端值一定是被夹住的，光看它验不出客户端的范围限制 ——
+      // coop 里"上半场那位推不过中线"主要发生在本地预测这一层。
+      paddleDisp: view.paddleDisp.map(function (v) { return Math.round(v * 10) / 10; }),
+      tail: view.balls.length ? (view.tails[view.balls[0].id] || []).length : 0,
+      // 场上**所有**球的服务端真值 [[x,y], ...]（分裂球会不止一个）
+      balls: view.balls.map(function (b) { return [Math.round(b.x), Math.round(b.y)]; }),
+      ballIds: view.balls.map(function (b) { return b.id; }),
+      // **画出来**的所有球（平滑之后的位置）
+      ballDisps: view.balls.map(function (b) {
+        var d = view.ballDisps[b.id] || { x: b.x, y: b.y };
+        return [Math.round(d.x * 10) / 10, Math.round(d.y * 10) / 10];
+      }),
+      // 兼容字段：0 号球。单球模式（未吃分裂球）下与 balls[0] / ballDisps[0] 完全相同，
+      // 这样既有探针不必改。多球时以 balls / ballDisps 为准。
+      ball: view.balls.length ? [Math.round(view.balls[0].x), Math.round(view.balls[0].y)] : [0, 0],
+      ballDisp: (function () {
+        if (!view.balls.length) return [0, 0];
+        var d0 = view.ballDisps[view.balls[0].id] || { x: view.balls[0].x, y: view.balls[0].y };
+        return [Math.round(d0.x * 10) / 10, Math.round(d0.y * 10) / 10];
+      })(),
+      present: view.present.slice(),
+      overlayHidden: overlay.classList.contains('hidden'),
+      // 真人主动暂停：状态 + 是谁按的 + 按钮当时写着什么/在不在
+      userPaused: !!view.userPaused,
+      pausedBy: view.pausedBy,
+      pauseBtnText: pauseBtn ? pauseBtn.textContent : null,
+      pauseBtnShown: !!(pauseBtn && pauseBtn.style.display !== 'none'),
+      // ---- 皮肤与技能 ----
+      skins: view.skins.slice(),
+      skillCd: view.skillCd.slice(),
+      boostArmed: view.boostArmed.slice(),
+      winds: view.winds.map(function (w) { return w.slice(); }),
+      phantom: view.phantom.slice(),
+      mySkin: view.mySide >= 0 ? (view.skins[view.mySide] || 0) : -1,
+      skinColors: SKIN_COL.slice(),
+      skinGlyphs: SKIN_GLYPH.slice(),
+      skinCdSec: SKIN_CD_S.slice(),
+      // 拍子**画出来**的填充色（皮肤色）。和 paddleColors（身份色，描边用）分开报，
+      // 探针就能分别核对"颜色 = 技能"和"coop 里两条拍子互相分得开"这两条。
+      paddleSkin: view.slots.map(function (_, i) { return skinFill(i, false); }),
+      // 技能按钮的**实际状态**，不是"按逻辑推出来的"：位置、显隐、写了什么字、类名。
+      // 探针要在真实布局上核对（比如"它到底有没有盖住球场"），不能靠复述代码里的判断。
+      skillBtns: skillBtnEls.map(function (el, i) {
+        if (!el) return null;
+        var r = el.getBoundingClientRect();
+        return {
+          shown: el.style.display !== 'none' && r.width > 0,
+          text: el.textContent,
+          cls: el.className,
+          x: Math.round(r.left), y: Math.round(r.top),
+          w: Math.round(r.width), h: Math.round(r.height),
+          mine: i === view.mySide,
+          skin: view.skins[i] || 0
+        };
+      }),
+      handshakeMs: view.handshakeMs,
+      canvasSize: [canvas.width, canvas.height],
+      // 场上道具：**数组**（可以同时有好几个），每一项是 [x, y, 类型]
+      powerups: view.powerups.map(function (u) { return u.slice(); }),
+      puMax: POWERUP_MAX,
+      // 让探针能核对"九种道具都有专属样式"，而不是全都静默落到兜底那一款
+      puKinds: POWERUP_STYLE.length,
+      puGlyphs: POWERUP_STYLE.map(function (s) { return s.label; }),
+      paddleMul: view.paddleMul.slice(),
+      freeze: view.freeze.slice(),
+      shield: view.shield.slice(),
+      double: view.double.slice(),
+      // 隐形球：各队"看不见球"还剩几秒 / 各队看到的球有多不透明（1 = 看得见）。
+      // ★ 球到底画了没有不属于这两个值 —— 探针要自己去画布上取证（抓 arc 调用），
+      //   否则就变成"拿输入断言输入"了。
+      invis: view.invis.slice(),
+      invisAlpha: view.invisAlpha.slice(),
+      // 我这一侧的观看透明度（ballVis 的返回值），以及"我是不是被隐形了"
+      ballVis: ballVis(),
+      myTeam: teamOfMine(),
+      solo: view.solo,
+      coop: view.coop,
+      mode: view.mode,
+      // 布局探针要能核对"左边两条各守半场、右边一条守全场"
+      slotEdges: view.slots.map(function (s) { return s.edge; }),
+      slotTeams: view.slots.map(function (s) { return s.team; }),
+      slotSpans: view.slots.map(function (s) { return s.span.slice(); }),
+      // 拍子**画出来**的颜色（不是"按队推出来"的）。coop 里两名真人必须各不相同，
+      // 靠这个能在探针里直接断言，不用去比截图颜色。
+      paddleColors: view.slots.map(function (_, i) { return paddleFill(i, false); }),
+      // 供探针做像素级检查。canvas 像素坐标 = 场地坐标 × dpr
+      geom: {
+        court: [W, H], margin: PADDLE_MARGIN,
+        paddleW: PADDLE_W, paddleH: PADDLE_H,
+        dpr: canvas.width / W
+      },
+      curve: view.curve,
+      botLevel: view.botLevel,
+      botName: view.botName,
+      bgmBase: BGM.base,
+      bgmSrc: BGM_SRC,
+      winScore: WIN_SCORE,
+      winMargin: WIN_MARGIN
+    };
+  };
+
+  // BGM 专用钩子：音频"有没有在响"是运行期状态，光看代码和截图都验不了
+  window.__bgm = function () {
+    var el = BGM.el;
+    if (!el) {
+      return { el: null, soundOn: soundOn, src: BGM_SRC, ready: BGM.ready, failed: BGM.failed };
+    }
+    return {
+      src: el.currentSrc || el.src,
+      loop: el.loop,
+      paused: el.paused,
+      volume: Math.round(el.volume * 10000) / 10000,
+      readyState: el.readyState,
+      duration: Math.round((el.duration || 0) * 100) / 100,
+      cur: Math.round(BGM.cur * 10000) / 10000,
+      want: Math.round(bgmTarget() * 10000) / 10000,
+      base: BGM.base,
+      ready: BGM.ready,
+      failed: BGM.failed,
+      soundOn: soundOn,
+      ctxState: audioCtx ? audioCtx.state : null,
+      btn: (document.getElementById('sfxBtn') || {}).textContent || ''
+    };
+  };
+  window.__setSound = function (on) { soundOn = !!on; bgmSyncUI(); return window.__bgm(); };
+  window.__bgmSrc = function () { return BGM_SRC; };
+
+  // ---------- 渲染 ----------
+  function rr(x, y, w, h, r) {
+    ctx.beginPath();
+    if (ctx.roundRect) { ctx.roundRect(x, y, w, h, r); return; }
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+
+  /**
+   * 拍子的**身份色**（描边用）。
+   * coop 按**槽位**取色（两名真人在同一条边上，按队取色会变成两条一模一样的蓝），
+   * 经典双人 / 人机按**队伍**取色（两侧各一队，本来就不一样）。
+   *
+   * ★ 加了皮肤系统之后，这个颜色从"填充"退成了"描边"，但**不能删**：
+   *   填充现在是玩家自选的皮肤色，而 coop 里两个人完全可能都选灰 ——
+   *   只按皮肤上色的话，两条灰板子又分不清谁是谁了（这正是当初做槽位配色的原因）。
+   *   填皮肤色、描身份色，两个诉求同时满足。
+   */
+  function paddleFill(si, frozen) {
+    var sl = view.slots[si];
+    if (view.coop) return (frozen ? COOP_COL_FROZEN : COOP_COL)[si];
+    if (frozen) return sl.team === 0 ? '#9fd8ff' : '#ffc0ae';
+    return sl.team === 0 ? COL.p0 : COL.p1;
+  }
+
+  /** 拍子的**皮肤色**（填充用）= 这个槽位选的技能的颜色。灰 = 没有技能 */
+  function skinFill(si, frozen) {
+    var s = view.skins[si];
+    if (!(s > 0) && s !== 0) return SKIN_COL[0];
+    return (frozen ? SKIN_COL_FROZEN : SKIN_COL)[s] || SKIN_COL[0];
+  }
+
+  /** 红色技能蓄力中：拍子外面套一圈呼吸的光，"下一板是超高速"一眼可见 */
+  function drawArmed(si, px, ph) {
+    var pulse = 0.5 + 0.5 * Math.sin(performance.now() / 150);
+    ctx.save();
+    ctx.globalAlpha = 0.30 + 0.45 * pulse;
+    ctx.strokeStyle = SKIN_COL[3];
+    ctx.lineWidth = 3;
+    rr(px - 5, view.paddleDisp[si] - ph / 2 - 5, PADDLE_W + 10, ph + 10, 10);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function frac(v) { return v - Math.floor(v); }
+
+  /** 确定性伪随机：同一个下标每次都得到同一个数。
+   *  ★ 不能用 Math.random —— 每帧重掷会让气流线原地乱跳，看起来是噪点而不是风。 */
+  function hashF(i, k) { return frac(Math.sin(i * 12.9898 + k * 78.233) * 43758.5453); }
+
+  /**
+   * 一阵风。画成沿风向扫过整个球场的一束气流线。
+   *
+   * 每条线的基准位置铺满球场，再按"相位 + 自己的随机偏移"沿风向平移 ——
+   * 相位只跟时间走，所以线条是**匀速平移**而不是闪烁的。
+   * 两端各留一段渐入渐出（fade），免得风"啪"地出现、"啪"地消失。
+   *
+   * ★ 画在球和拍子**下面**：风是氛围，把球糊住就本末倒置了。
+   * ★ 方向取自服务端下发的单位向量 —— 客户端不自己算方向，否则两边一旦不一致，
+   *   玩家会看到"风吹这边、球往那边走"。施力和表现必须是同一个方向。
+   */
+  function drawWind(w, idx) {
+    var dx = w[0];
+    var dy = w[1];
+    var total = WIND_MS / 1000;
+    var life = Math.max(0, Math.min(1, w[2] / total));      // 1 = 刚放出，0 = 快没了
+    var fade = Math.min(1, (1 - life) * 7) * Math.min(1, life * 7);
+    if (fade <= 0.01) return;
+    var diag = Math.sqrt(W * W + H * H);
+    var phase = (performance.now() / 620 + idx * 0.37) % 1;
+    ctx.save();
+    ctx.lineCap = 'round';
+    ctx.strokeStyle = '#67e8f9';
+    for (var i = 0; i < 26; i += 1) {
+      var r1 = hashF(i, 1);
+      var r2 = hashF(i, 2);
+      var r3 = hashF(i, 3);
+      var off = (((r3 + phase) % 1) * 2 - 1) * diag;
+      var x = r1 * W + dx * off;
+      var y = r2 * H + dy * off;
+      if (x < -60 || x > W + 60 || y < -60 || y > H + 60) continue;
+      var len = 30 + r3 * 55;
+      ctx.globalAlpha = fade * (0.14 + 0.30 * r1);
+      ctx.lineWidth = 1.4 + r2 * 1.8;
+      ctx.beginPath();
+      ctx.moveTo(x - dx * len, y - dy * len);
+      ctx.lineTo(x, y);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  /** 我属于哪一队。view.mySide 是**槽位**号；coop 里左边两个槽位同属 0 队 */
+  function teamOfMine() {
+    var sl = view.slots[view.mySide];
+    return sl ? sl.team : -1;
+  }
+
+  /**
+   * 我这一侧**看到的球**有多不透明（1 = 完全看得见，0 = 完全看不见）。
+   *
+   * 隐形球是"吃到的人看得见、对面看不见"。透明度曲线由服务端算好下发
+   * （见服务端 invisAlpha），这里只把"我属于哪一队"映射到那个数组上 ——
+   * 渐变只有一份实现，两边不可能各算各的然后悄悄错位。
+   *
+   * ★ 这是**客户端**过滤，不是"服务端不给你发坐标"：快照里的球位置双方都收得到。
+   *   所以严格说，改了客户端的人能作弊看见球。这是个休闲双人游戏，
+   *   对手本来就能扭头看你的屏幕，为此把每个座位的快照拆开发并不值当。
+   *   对不作弊的玩家，"看不见"就是真的看不见，与服务端权威的判定也完全一致
+   *   （球打到拍子上的判定从来只在服务端做）。
+   */
+  function ballVis() {
+    var t = teamOfMine();
+    if (t < 0) return 1;                        // 没入座（还在菜单里）不隐藏
+    var a = view.invisAlpha[t];
+    return typeof a === 'number' ? a : 1;
+  }
+
+  function drawPowerup(x, y, type) {
+    var st = POWERUP_STYLE[type] || POWERUP_STYLE[0];
+    var pulse = 0.5 + 0.5 * Math.sin(performance.now() / 190);
+
+    // 外圈脉冲，让它在深色场地上足够显眼
+    ctx.beginPath();
+    ctx.arc(x, y, POWERUP_R + 4 + pulse * 3, 0, Math.PI * 2);
+    ctx.strokeStyle = st.c;
+    ctx.globalAlpha = 0.16 + 0.14 * pulse;
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+
+    ctx.beginPath();
+    ctx.arc(x, y, POWERUP_R, 0, Math.PI * 2);
+    ctx.fillStyle = st.c;
+    ctx.globalAlpha = 0.18;
+    ctx.fill();
+    ctx.globalAlpha = 1;
+
+    ctx.beginPath();
+    ctx.arc(x, y, POWERUP_R, 0, Math.PI * 2);
+    ctx.strokeStyle = st.c;
+    ctx.lineWidth = 2.5;
+    ctx.stroke();
+
+    // 单字符用大号，两字符（如 "2×"）得缩一号，否则会顶出圆圈
+    ctx.font = '700 ' + (st.label.length > 1 ? 15 : 21) + 'px ui-monospace, Menlo, Consolas, monospace';
+    ctx.fillStyle = st.c;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(st.label, x, y + 1);
+  }
+
+  /** 拍子被冰冻的标记。放在场地内侧固定距离，避免贴着边被裁掉 */
+  function drawFrozen(slot, secs) {
+    var sl = view.slots[slot];
+    var x = sl.edge === 'left'
+      ? PADDLE_MARGIN + PADDLE_W + 30
+      : W - PADDLE_MARGIN - PADDLE_W - 30;
+    ctx.font = '700 13px ui-monospace, Menlo, Consolas, monospace';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = '#8fd6ff';
+    ctx.fillText('❄ ' + secs.toFixed(1) + 's', x, view.paddleDisp[slot]);
+  }
+
+  /** 护盾：贴在底线内侧的一道亮条，上面的 ×N 是剩余次数（按队，不是按拍子） */
+  function drawShield(slot) {
+    var sl = view.slots[slot];
+    var n = view.shield[sl.team];
+    if (!n) return;
+    var y = view.paddleDisp[slot];
+    var x = sl.edge === 'left' ? 7 : W - 7;
+    var half = PADDLE_H * 0.66;
+
+    ctx.strokeStyle = '#38bdf8';
+    ctx.lineWidth = 4;
+    ctx.globalAlpha = 0.9;
+    ctx.beginPath();
+    ctx.moveTo(x, y - half);
+    ctx.lineTo(x, y + half);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+
+    // ×N 只标在该队的第一个拍子上 —— coop 里左队有两块拍子，
+    // 每块都写一遍会让人以为有两个独立的护盾
+    var firstOfTeam = view.slots.findIndex(function (s) { return s.team === sl.team; }) === slot;
+    if (!firstOfTeam) return;
+    ctx.font = '700 12px ui-monospace, Menlo, Consolas, monospace';
+    ctx.fillStyle = '#38bdf8';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('×' + n, x, y - half - 12);
+  }
+
+  /**
+   * 暂停提示里那句"是谁按的"。
+   * coop 里守同一条边的另一位是**队友**，说成"对手"会把人看糊涂。
+   */
+  function pauseWhoText() {
+    if (view.pausedBy < 0) return '';
+    if (view.pausedBy === view.mySide) return '你按下的暂停';
+    return (view.coop ? '队友' : '对手') + '按下的暂停';
+  }
+
+  function draw() {
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+
+    ctx.fillStyle = COL.court;
+    ctx.fillRect(0, 0, W, H);
+
+    // 上下墙
+    ctx.fillStyle = COL.wall;
+    ctx.fillRect(0, 0, W, 3);
+    ctx.fillRect(0, H - 3, W, 3);
+
+    // 中线
+    ctx.setLineDash([14, 18]);
+    ctx.strokeStyle = COL.mid;
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(W / 2, 0);
+    ctx.lineTo(W / 2, H);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // coop：左半边被一条水平线分成上下两个半场，两个真人各守一半。
+    // ★ 只画左半边 —— 右边整条都是 AI 一个人的，画过去会让人以为它也分成了两段。
+    if (view.coop) {
+      ctx.setLineDash([10, 14]);
+      ctx.strokeStyle = 'rgba(77,163,255,0.30)';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(0, H / 2);
+      ctx.lineTo(W / 2, H / 2);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+
+    // 比分
+    ctx.font = '500 62px ui-monospace, Menlo, Consolas, monospace';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = 'rgba(143,163,191,0.22)';
+    ctx.fillText(String(view.score[0]), W / 2 - 90, 78);
+    ctx.fillText(String(view.score[1]), W / 2 + 90, 78);
+
+    // 双倍得分生效时挂在比分外侧。不加这个标记，分数一次跳两分会被当成 bug
+    ctx.font = '700 15px ui-monospace, Menlo, Consolas, monospace';
+    ctx.fillStyle = '#f0abfc';
+    if (view.double[0]) ctx.fillText('×2', W / 2 - 148, 78);
+    if (view.double[1]) ctx.fillText('×2', W / 2 + 148, 78);
+
+    // AI 模式：把对手是谁写出来，免得以为在跟真人打
+    if (view.solo) {
+      ctx.font = '400 12px -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif';
+      ctx.fillStyle = COL.faint;
+      ctx.fillText('AI · ' + (view.botName || LEVEL_NAMES[view.botLevel] || '普通'),
+        W / 2 + 90, 112);
+      // coop：左边那半场是两个人合作守的，标一下，免得以为对面只有一个人
+      if (view.coop) ctx.fillText('2 人合作', W / 2 - 90, 112);
+    }
+
+    // 10 平之后把规则摆出来，免得人以为"怎么赢了还不结束"
+    var s0 = view.score[0], s1 = view.score[1];
+    if (view.phase === 'playing' && s0 >= WIN_SCORE - 1 && s1 >= WIN_SCORE - 1
+        && Math.abs(s0 - s1) <= 1) {
+      ctx.font = '400 14px -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif';
+      ctx.fillStyle = COL.good;
+      ctx.fillText('追分中 · 需净胜 2 分', W / 2, 122);
+    }
+
+    // 隐形球的提示。★ 两个方向都必须写：
+    //   · 被隐形的人要知道"球是隐形了，不是我卡了/渲染坏了"，还得知道还剩多久，
+    //     否则他只会觉得游戏出 bug 了 —— 这道道具的整个体验就毁在这儿；
+    //   · 吃到的人要知道"这一下生效了"，不然他从头到尾没有任何反馈。
+    if (view.phase === 'playing' || view.phase === 'countdown') {
+      var mt = teamOfMine();
+      var ft = mt < 0 ? -1 : 1 - mt;
+      ctx.font = '400 14px -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif';
+      if (mt >= 0 && view.invis[mt] > 0) {
+        ctx.fillStyle = '#fca5a5';
+        ctx.fillText('球被隐形 · 靠预判 ' + view.invis[mt].toFixed(1) + 's', W / 2, 146);
+      } else if (ft >= 0 && view.invis[ft] > 0) {
+        ctx.fillStyle = '#86efac';
+        ctx.fillText('对手看不见球 ' + view.invis[ft].toFixed(1) + 's', W / 2, 146);
+      }
+    }
+
+    // 幻影球生效中。★ 只给**释放方**看，而且只写"还在生效"、一个字都不提位置 ——
+    //   对手那边连"场上有两个球"都不该被提示，那正是这个技能的全部意义。
+    if (view.phase === 'playing' && view.mySide >= 0) {
+      var mtp = teamOfMine();
+      if (mtp >= 0 && view.phantom[mtp] > 0) {
+        ctx.font = '400 14px -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillStyle = SKIN_COL[2];
+        ctx.fillText('幻影生效中 ' + view.phantom[mtp].toFixed(1) + 's', W / 2, 168);
+      }
+    }
+
+    // 风：沿风向扫过整个球场的气流线。画在道具 / 球 / 拍子**下面** —— 它是氛围，
+    // 把球糊住就本末倒置了。场上可能同时有多股（两个人都是青拍子），逐个画。
+    for (var wi = 0; wi < view.winds.length; wi += 1) {
+      var ww = view.winds[wi];
+      if (ww && ww.length === 3) drawWind(ww, wi);
+    }
+
+    // 道具（球拍下面一层，避免盖住拍子）。场上可以**同时挂多个**，逐个画。
+    // ★ 不能只画第一个：服务端会同时下发好几个，漏画会让玩家看到
+    //   "球撞到了看不见的东西"。
+    for (var ui = 0; ui < view.powerups.length; ui += 1) {
+      var uu = view.powerups[ui];
+      if (uu && uu.length === 3) drawPowerup(uu[0], uu[1], uu[2]);
+    }
+
+    // 球拍：长度按服务端下发的倍率画，条数与位置按槽位表（经典 2 条，coop 3 条）。
+    // ★ 必须跟着倍率走，否则吃到"加长"后会看着明明碰到了却没弹回来。
+    var xL = PADDLE_MARGIN;
+    var xR = W - PADDLE_MARGIN - PADDLE_W;
+
+    // ★ 这里原来还会在"自己那块拍子"旁边（xL-5 / xR+PADDLE_W+5）画一条**平行白线**，
+    //   用来标出哪条是自己的。但它和拍子中间隔着几像素背景，看着就是一根没人管的杂线，
+    //   用户明确要求去掉 —— 已删，且不加替代物（描边、箭头之类一律不加）。
+    //   现在靠这两样认自己的拍子：① coop 里两名真人**各是一个颜色**（见 paddleFill）；
+    //   ② 底部常驻栏写着「你守上半场 / 下半场」。经典双人模式按一下方向键也就知道了。
+    for (var si = 0; si < view.slots.length; si += 1) {
+      var sl = view.slots[si];
+      var ph = PADDLE_H * view.paddleMul[sl.team];
+      var px = sl.edge === 'left' ? xL : xR;
+      // 被冰冻时拍子换冰色。只冻住不说明原因，人会以为是自己键盘坏了
+      var frz = view.freeze[sl.team] > 0;
+      rr(px, view.paddleDisp[si] - ph / 2, PADDLE_W, ph, 7);
+      // 填 = 皮肤色（= 技能），描 = 身份色。
+      // ★ 两样都要，理由见 paddleFill 的注释：颜色现在由玩家自选，coop 里两个人
+      //   完全可能都选灰，只按皮肤上色就分不清谁是谁了。
+      ctx.fillStyle = skinFill(si, frz);
+      ctx.fill();
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = paddleFill(si, frz);
+      ctx.stroke();
+      if (view.boostArmed[si]) drawArmed(si, px, ph);
+      if (frz) drawFrozen(si, view.freeze[sl.team]);
+    }
+    for (var sj = 0; sj < view.slots.length; sj += 1) {
+      if (view.shield[view.slots[sj].team] > 0) drawShield(sj);
+    }
+
+    // 球（分裂球会让这里有好几个，逐个画）
+    // ★ 隐形球生效时，被隐形的那一队看到的是"透明的球"：透明度由服务端下发。
+    //   全透明时**连尾迹都不画**（只跳过球体、留着尾迹等于还是看得见），
+    //   而且要"提前返回"到下一颗球，不能只把 alpha 设成 0 就往下走。
+    var vis = ballVis();
+    if (view.phase === 'playing' || view.phase === 'over') {
+      for (var bi2 = 0; bi2 < view.balls.length; bi2 += 1) {
+        var ball = view.balls[bi2];
+        var bd = view.ballDisps[ball.id];
+        if (!bd) continue;
+        if (vis <= 0.004) continue;              // 看不见就是看不见，什么都不画
+        // 弧线球生效时画一串渐隐的尾迹 —— 不画的话玩家只会觉得"球有点飘"，
+        // 完全看不出是被道具影响了，也不知道往哪边飘
+        var tail = view.tails[ball.id] || [];
+        if (view.curve && tail.length > 1) {
+          for (var ti = 0; ti < tail.length; ti += 1) {
+            var tq = ti / tail.length;
+            ctx.globalAlpha = tq * 0.42 * vis;
+            ctx.beginPath();
+            ctx.arc(tail[ti].x, tail[ti].y, BALL_R * (0.25 + tq * 0.7), 0, Math.PI * 2);
+            ctx.fillStyle = view.curve > 0 ? '#7dd3fc' : '#c4b5fd';
+            ctx.fill();
+          }
+          ctx.globalAlpha = 1;
+        }
+        ctx.beginPath();
+        ctx.arc(bd.x, bd.y, BALL_R, 0, Math.PI * 2);
+        ctx.fillStyle = view.curve ? '#5eead4' : COL.ball;
+        ctx.globalAlpha = vis;
+        ctx.fill();
+        ctx.globalAlpha = 1;
+      }
+    }
+
+    // 倒计时
+    if (view.phase === 'countdown') {
+      var secs = Math.ceil(view.countdownMs / 1000);
+      ctx.font = '500 20px -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif';
+      ctx.fillStyle = COL.text;
+      ctx.fillText(secs > 0 ? secs + '' : '开始', W / 2, H / 2 + 4);
+    }
+
+    // 结束
+    if (view.phase === 'over' && view.winner >= 0) {
+      ctx.font = '500 26px -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif';
+      ctx.fillStyle = COL.good;
+      ctx.fillText('本局结束', W / 2, H / 2 - 16);
+      ctx.font = '400 15px -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif';
+      ctx.fillStyle = COL.text;
+      // ★ winner 是**队伍**号，mySide 是槽位号。coop 里左边两个座位同属 0 队，
+      //   直接拿 mySide 去比，会让守下半场的那位永远看到"对手赢了"。
+      var winTxt = view.winner === teamOfMine()
+        ? (view.coop ? '你们赢了' : '你赢了')
+        : (view.solo ? 'AI 赢了' : '对手赢了');
+      ctx.fillText(winTxt + ' · ' + view.score[0] + ' : ' + view.score[1], W / 2, H / 2 + 16);
+    }
+
+    // 缺人 / 暂停提示
+    if (view.mySide >= 0 && view.phase === 'waiting') {
+      var hasPeer = view.present.length === view.slots.length
+        && view.present.every(function (v) { return v === 1; });
+      ctx.font = '400 15px -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif';
+      ctx.fillStyle = COL.faint;
+      ctx.fillText(hasPeer
+        ? '已暂停'
+        : (view.coop ? '等待队友加入…' : '等待对手加入…'), W / 2, H / 2 + 60);
+    }
+
+    // 暂停（真人按的）。
+    // ★ 与"缺人自动冻结"分开：那种情况 phase 是 waiting，上面刚画过"等待对手加入…"，
+    //   这里再糊一层就是两行字叠在一起。
+    // ★ 画在所有运动物体**之后**，所以球会被压暗 —— 要的就是"停住了"的观感，
+    //   而不是"球不动了但界面毫无变化"（那样人只会以为自己卡了或者对面掉线了）。
+    if (view.userPaused && view.mySide >= 0 && view.phase !== 'waiting') {
+      ctx.fillStyle = 'rgba(9, 13, 24, 0.58)';
+      ctx.fillRect(0, 0, W, H);
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.font = '500 26px -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif';
+      ctx.fillStyle = '#e8eefb';
+      ctx.fillText('已暂停', W / 2, H / 2 - 20);
+      ctx.font = '400 14px -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif';
+      ctx.fillStyle = COL.text;
+      ctx.fillText(pauseWhoText(), W / 2, H / 2 + 12);
+      ctx.fillText('任意一方点「继续」即可恢复', W / 2, H / 2 + 36);
+    }
+
+    // 断线时在画面上直说，别让人以为是自己的操作卡住了
+    if (view.mySide >= 0 && !view.connected) {
+      ctx.fillStyle = 'rgba(9, 13, 24, 0.74)';
+      ctx.fillRect(0, 0, W, H);
+      ctx.font = '500 20px -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif';
+      ctx.fillStyle = '#ffb4a2';
+      ctx.fillText('连接断开，正在重连…', W / 2, H / 2);
+      ctx.font = '400 14px -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif';
+      ctx.fillStyle = COL.text;
+      ctx.fillText('重连后会自动坐回原位，比分不会丢', W / 2, H / 2 + 26);
+    }
+  }
+
+  var lastFrame = 0;
+  function loop(ts) {
+    var dt = lastFrame ? Math.min((ts - lastFrame) / 1000, 0.05) : 0.016;
+    lastFrame = ts;
+
+    // 暂停中**不做本地预测**：服务端此时根本不推进拍子，本地先动起来的话，
+    // 恢复那一刻会被"与服务器对账"那一句拽回去（看起来像抖了一下），
+    // 而且暂停时把拍子挪走本来也算不上是"暂停"。触摸目标一起冻住，理由相同。
+    var frozen = !!view.userPaused;
+
+    // 自己的拍子本地预测：立刻响应操作，不等服务器回话
+    if (view.mySide >= 0 && !frozen && view.slots[view.mySide]) {
+      var i = view.mySide;
+      var mi = view.slots[i];
+      var d = view.dir;
+      var myHalf = (PADDLE_H * view.paddleMul[mi.team]) / 2;   // 拍子变长后边界也跟着变
+      // ★ 活动范围要按模式收窄：coop 里守上半场那位不能把拍子推过半场线。
+      //   不收的话本地预测会先冲出去、再被服务器拽回来，看起来像在抖。
+      var lo = mi.span[0] + myHalf;
+      var hi = mi.span[1] - myHalf;
+      if (d !== 0 && hi >= lo) {
+        view.paddleDisp[i] = Math.max(lo,
+          Math.min(hi, view.paddleDisp[i] + d * PADDLE_SPEED * dt));
+      }
+      // 与服务器对账：只有偏差很大才拉回，避免正常情况下的抖动
+      var diff = view.paddles[i] - view.paddleDisp[i];
+      if (Math.abs(diff) > 50) view.paddleDisp[i] += diff * 0.25;
+    }
+
+    // 其余拍子与球：向服务器值收敛，抹平 30Hz 的台阶。
+    // ★ 落后量 ≈ 球速/26（与帧率无关），这是这个游戏里"看到的球"和
+    //   "服务端判定的球"之间唯一的时差来源，改动前先看清这一点。
+    var k = Math.min(1, dt * 26);
+    for (var pi = 0; pi < view.slots.length; pi += 1) {
+      if (pi === view.mySide) continue;
+      view.paddleDisp[pi] += (view.paddles[pi] - view.paddleDisp[pi]) * k;
+    }
+
+    // 球：逐个 id 收敛并采样尾迹
+    for (var bi = 0; bi < view.balls.length; bi += 1) {
+      var bb = view.balls[bi];
+      var dp = view.ballDisps[bb.id];
+      if (!dp) continue;                      // 理论上不会发生（贴快照时已建）
+      dp.x += (bb.x - dp.x) * k;
+      dp.y += (bb.y - dp.y) * k;
+
+      var tail = view.tails[bb.id] || (view.tails[bb.id] = []);
+      // 位置突然跳变（发球、得分后重新开球、分裂出来的新球）就把旧尾巴丢掉，
+      // 否则会从上一个落点拉出一条横贯全场的假弧线
+      var tl = tail[tail.length - 1];
+      if (tl && Math.abs(dp.x - tl.x) + Math.abs(dp.y - tl.y) > 120) tail.length = 0;
+      tail.push({ x: dp.x, y: dp.y });
+      if (tail.length > 18) tail.shift();
+    }
+
+    // 触摸目标跟随
+    if (touchTargetY !== null && view.mySide >= 0 && !frozen) {
+      var td = touchTargetY - view.paddleDisp[view.mySide];
+      setDir(Math.abs(td) > 8 ? (td > 0 ? 1 : -1) : 0);
+    }
+
+    bgmTick(dt);        // 用真实 dt；音量状态机不该被游戏的暂停冻住
+
+    fitCanvas();
+    layoutSkillBtns();  // 技能按钮每帧跟着自己的拍子走（拍子一直在动）
+    draw();
+    requestAnimationFrame(loop);
+  }
+
+  // 面板低频刷新，别把主线程拖慢
+  setInterval(renderMeters, 400);
+
+  // ---------- 启动 ----------
+  var pendingCode = null;     // URL 里带进来的邀请码，只在首次加入时用一次
+  var lastJoinCode = null;    // 刚才尝试加入的码，失败时填回输入框
+
+  (function boot() {
+    var params = new URLSearchParams(location.search);
+    var r = (params.get('room') || '').trim().toUpperCase();
+    if (/^[A-Z0-9]{6}$/.test(r)) {
+      pendingCode = r;
+      // 邀请码指向另一个房间时，旧座位就没意义了，丢掉以免坐回去
+      var s = readSession();
+      if (s && s.code !== pendingCode) clearSession();
+    }
+  })();
+
+  bgmInit();                  // 提前开始加载，等第一次点击就能直接响
+  fitCanvas();
+  requestAnimationFrame(loop);
+
+  // 连上之后走哪条路，统一由 onConnected 判断，这里只负责发起连接
+  connect();
+
+  window.addEventListener('resize', fitCanvas);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,16 @@
+{
+  "name": "pong-online",
+  "version": "1.0.0",
+  "private": true,
+  "description": "双人实时对战乒乓球 - 用于验证 WebSocket 长连接在发布环境中的可用性",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
