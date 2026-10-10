@@ -793,6 +793,16 @@
     rttCount: 0,
     snaps: 0,
     lastSnapAt: 0,
+    matchId: '',
+    matchFrames: [],
+    matchFrameLimit: 18000,
+    matchFrameNo: 0,
+    reportedMatchId: '',
+    serverClockOffset: 0,
+    serverClockSynced: false,
+    clockSyncRtt: Infinity,
+    lastSnapshotServerTime: 0,
+    pendingPingWall: Object.create(null),
     intervals: [],
     drops: 0,
     lastTick: 0,
@@ -839,6 +849,163 @@
     for (var k in view.ballDisps) {
       if (!seen[k]) { delete view.ballDisps[k]; delete view.tails[k]; }
     }
+  }
+
+  /** 记录当前浏览器动画帧中的服务端快照值与实际渲染值。 */
+  function recordMatchFrame(ts) {
+    if (view.phase !== 'playing' || !view.matchId || view.mySide < 0) return;
+    var perfNow = performance.now();
+    var wallNow = Date.now();
+    var balls = view.balls.map(function (b) {
+      var d = view.ballDisps[b.id] || { x: b.x, y: b.y };
+      return {
+        id: b.id,
+        server: [Math.round(b.x * 10) / 10, Math.round(b.y * 10) / 10],
+        rendered: [Math.round(d.x * 10) / 10, Math.round(d.y * 10) / 10]
+      };
+    });
+    var paddles = view.paddles.map(function (y, i) {
+      var slot = view.slots[i] || { team: i, edge: 'unknown' };
+      var half = PADDLE_H * (view.paddleMul[slot.team] || 1) / 2;
+      return {
+        slot: i,
+        team: slot.team,
+        edge: slot.edge,
+        serverY: Math.round(y * 10) / 10,
+        renderedY: Math.round((view.paddleDisp[i] || 0) * 10) / 10,
+        catchHalfHeight: Math.round((half + BALL_R) * 10) / 10
+      };
+    });
+    view.matchFrames.push({
+      frameNo: ++view.matchFrameNo,
+      perfMs: Math.round((typeof ts === 'number' ? ts : perfNow) * 10) / 10,
+      clientWallMs: wallNow,
+      estimatedServerMs: wallNow + view.serverClockOffset,
+      serverTick: view.lastTick,
+      snapshotAgeMs: view.serverClockSynced && view.lastSnapshotServerTime
+        ? Math.max(0, Math.round(wallNow + view.serverClockOffset - view.lastSnapshotServerTime))
+        : null,
+      rttMs: Math.round(view.rtt),
+      balls: balls,
+      paddles: paddles
+    });
+    if (view.matchFrames.length > view.matchFrameLimit) {
+      view.matchFrames.splice(0, 3000);
+    }
+  }
+
+  function compareMissWithClientFrame(miss) {
+    var approach = miss.approach;
+    if (!approach || !approach.closest || !miss.ball || miss.ball.id === null) {
+      return { verdict: '证据不足：服务端未记录到球接近拍面的判定窗口', miss: miss };
+    }
+    var targetTick = approach.tick + 1;
+    var targetServerTime = approach.serverTime;
+    var nearest = null;
+    var nearestScore = Infinity;
+    for (var i = 0; i < view.matchFrames.length; i += 1) {
+      var frame = view.matchFrames[i];
+      var ball = frame.balls.find(function (b) { return b.id === miss.ball.id; });
+      if (!ball) continue;
+      var tickGap = Math.abs(frame.serverTick - targetTick);
+      var timeGap = Math.abs(frame.estimatedServerMs - targetServerTime);
+      var score = view.serverClockSynced ? timeGap * 100 + tickGap : tickGap * 100 + timeGap;
+      if (score < nearestScore) {
+        nearestScore = score;
+        nearest = { frame: frame, ball: ball, tickGap: tickGap, timeGapMs: timeGap };
+      }
+    }
+    var paddle = nearest && nearest.frame.paddles.find(function (p) {
+      return p.slot === approach.closest.slot;
+    });
+    var serverMargin = approach.closest.catchMargin;
+    if (!nearest || !paddle) {
+      return {
+        verdict: '证据不足：本地没有找到同一球与对应球拍的动画帧',
+        miss: miss,
+        serverCatchMargin: serverMargin,
+        comparedFrame: nearest ? nearest.frame : null
+      };
+    }
+    var clientMargin = Math.abs(nearest.ball.rendered[1] - paddle.renderedY) - paddle.catchHalfHeight;
+    var aligned = view.serverClockSynced
+      ? nearest.timeGapMs <= Math.max(150, view.rtt + 50)
+      : nearest.tickGap <= 2;
+    var verdict;
+    if (serverMargin < -0.5) {
+      verdict = '服务端判定疑似异常：服务端记录显示球在接球范围内却仍记失分';
+    } else if (!aligned) {
+      verdict = '证据不足：客户端帧与服务端失分时刻未能可靠对齐';
+    } else if (clientMargin < -0.5) {
+      verdict = view.rtt >= 120 || (nearest.frame.snapshotAgeMs || 0) >= 100
+        || nearest.tickGap >= 3
+        ? '客户端画面显示可接、服务端判定漏接：疑似传输/快照延迟造成观感不一致'
+        : '客户端画面显示可接、服务端判定漏接：疑似插值或本地拍子预测差异，暂不能归因于网络延迟';
+    } else {
+      verdict = '客户端画面与服务端判定一致：该帧球未进入拍子的接球范围';
+    }
+    return {
+      verdict: verdict,
+      myTeam: teamOfMine(),
+      isMyTeamConceded: miss.concededBy === teamOfMine(),
+      serverCatchMargin: serverMargin,
+      clientRenderedCatchMargin: Math.round(clientMargin * 10) / 10,
+      clientVisibleBall: nearest.ball.rendered,
+      clientVisiblePaddleY: paddle.renderedY,
+      renderedVsSnapshotDelta: [
+        Math.round((nearest.ball.rendered[0] - nearest.ball.server[0]) * 10) / 10,
+        Math.round((nearest.ball.rendered[1] - nearest.ball.server[1]) * 10) / 10
+      ],
+      paddleSlot: paddle.slot,
+      tickDifference: nearest.tickGap,
+      estimatedTimeDifferenceMs: Math.round(nearest.timeGapMs),
+      rttMs: nearest.frame.rttMs,
+      snapshotAgeMs: nearest.frame.snapshotAgeMs,
+      serverApproach: approach,
+      serverMiss: miss,
+      nearestClientFrame: nearest.frame
+    };
+  }
+
+  function emitMatchReport(message) {
+    if (!message.mi || !Array.isArray(message.mr) || view.reportedMatchId === message.mi) return;
+    view.reportedMatchId = message.mi;
+    var comparisons = message.mr.map(compareMissWithClientFrame);
+    var serverSuspects = comparisons.filter(function (c) {
+      return c.verdict.indexOf('服务端判定疑似异常') === 0;
+    }).length;
+    var apparentClientCatches = comparisons.filter(function (c) {
+      return c.verdict.indexOf('客户端画面显示可接') === 0;
+    }).length;
+    var insufficient = comparisons.filter(function (c) {
+      return c.verdict.indexOf('证据不足') === 0;
+    }).length;
+    var verdict = serverSuspects
+      ? '发现服务端判定疑点，优先检查碰撞判定逻辑。'
+      : apparentClientCatches
+        ? '至少有一分客户端画面看似可接而服务端记为漏接；结合 RTT / 快照年龄判断是网络延迟还是本地渲染预测偏差。'
+        : '未发现客户端画面与服务端判定明确冲突；证据不足的项目需要结合实际网络复现。';
+    console.groupCollapsed('[Pong 本局失分对照报告] ' + message.mi
+      + ' · 最终比分 ' + message.s.join(':'));
+    console.log({
+      matchId: message.mi,
+      finalScore: message.s,
+      winnerTeam: message.wn,
+      localTeam: teamOfMine(),
+      serverMissCount: message.mr.length,
+      clientFramesCaptured: view.matchFrames.length,
+      clientFrameLimitReached: view.matchFrameNo > view.matchFrameLimit,
+      serverClockOffsetMs: view.serverClockSynced ? Math.round(view.serverClockOffset) : null,
+      clockSyncRttMs: view.clockSyncRtt === Infinity ? null : Math.round(view.clockSyncRtt),
+      summary: {
+        serverRuleSuspects: serverSuspects,
+        clientFrameAppearedCatchable: apparentClientCatches,
+        insufficientEvidence: insufficient
+      },
+      verdict: verdict,
+      points: comparisons
+    });
+    console.groupEnd();
   }
 
   function setMode(mode, wh) {
@@ -1242,11 +1409,18 @@
   var pingTimer = null;
   function startPing() {
     if (pingTimer) clearInterval(pingTimer);
-    pingTimer = setInterval(function () {
+    var ping = function () {
       if (sock && sock.readyState === 1) {
-        sock.send(JSON.stringify({ t: 'ping', ts: Math.round(performance.now()) }));
+        var ts = Math.round(performance.now());
+        var wall = Date.now();
+        view.pendingPingWall[ts] = wall;
+        var pendingTs = Object.keys(view.pendingPingWall);
+        while (pendingTs.length > 8) delete view.pendingPingWall[pendingTs.shift()];
+        sock.send(JSON.stringify({ t: 'ping', ts: ts }));
       }
-    }, 2000);
+    };
+    ping();
+    pingTimer = setInterval(ping, 2000);
   }
 
   // ---- 断线期间的"用户意图"要先攒着，不能丢 ----
@@ -1295,12 +1469,24 @@
         view.rtt = rtt;
         view.rttSum += rtt;
         view.rttCount += 1;
+        var sentWall = view.pendingPingWall[m.ts];
+        delete view.pendingPingWall[m.ts];
+        if (typeof sentWall === 'number' && typeof m.st === 'number'
+            && (!view.serverClockSynced || rtt <= view.clockSyncRtt)) {
+          view.serverClockOffset = m.st - (sentWall + (Date.now() - sentWall) / 2);
+          view.serverClockSynced = true;
+          view.clockSyncRtt = rtt;
+        }
         break;
       }
       case 'joined':
       case 'rejoined': {
         view.mySide = m.side;
         view.code = m.code;
+        view.matchId = '';
+        view.matchFrames = [];
+        view.matchFrameNo = 0;
+        view.reportedMatchId = '';
         // 刚坐下一定是"还没开打"：把上一次对局残留的阶段与暂停状态清掉，
         // 否则从一局里退出来再进新房时，那一瞬间按钮会按旧阶段的判断显示出来。
         view.phase = 'waiting';
@@ -1328,12 +1514,14 @@
       }
       case 'state': {
         var now = performance.now();
+        var snapshotGapMs = view.lastSnapAt ? now - view.lastSnapAt : 0;
         if (view.lastSnapAt) {
-          var gap = now - view.lastSnapAt;
+          var gap = snapshotGapMs;
           view.intervals.push(gap);
           if (view.intervals.length > 90) view.intervals.shift();
         }
         view.lastSnapAt = now;
+        view.lastSnapshotServerTime = typeof m.st === 'number' ? m.st : 0;
         view.snaps += 1;
 
         // 场地尺寸每帧随包下发。尺寸变了说明模式变了（例如刷新后重连进的是另一个模式），
@@ -1341,6 +1529,12 @@
         if (m.wh && (W !== m.wh[0] || H !== m.wh[1])) setMode(m.md || view.mode, m.wh);
         else if (m.md && m.md !== view.mode) setMode(m.md, m.wh);
 
+        if (m.mi && m.mi !== view.matchId) {
+          view.matchId = m.mi;
+          view.matchFrames = [];
+          view.matchFrameNo = 0;
+          view.reportedMatchId = '';
+        }
         view.phase = m.ph;
         // 真人主动暂停。★ 单独读，不从 ph 反推 —— 见 view.userPaused 的注释。
         //   服务端下发的 up 已经是"真正生效"的那个值（第一局还没开始时按下的暂停不算数）。
@@ -1386,6 +1580,7 @@
         view.canReselect = m.rsel === 1;
         syncReselect(view.canReselect);
         syncSkillBtns();
+        if (m.ph === 'over' && m.mr) emitMatchReport(m);
 
         // 事件是"这一批快照里发生的事"，服务端发完即清。
         // 主循环一轮可能推进多个 tick 才广播一次，所以这里可能一次收到多个事件。
@@ -3142,6 +3337,7 @@
     fitCanvas();
     layoutSkillBtns();  // 技能按钮每帧跟着自己的拍子走（拍子一直在动）
     draw();
+    recordMatchFrame(ts);
     requestAnimationFrame(loop);
   }
 

@@ -498,6 +498,11 @@ function createRoom(code, mode, level) {
     //   客户端会把剩下的球从旧位置平滑地"滑"到新位置 —— 看起来像球在瞬移。
     balls: [makeBall(court.W / 2, court.H / 2)],
     score: [0, 0],
+    matchNo: 0,
+    matchId: '',
+    missLog: [],
+    lastMissApproach: Object.create(null),
+    substep: -1,
     phase: 'countdown', // countdown | playing | over（对外的 waiting 由 paused/started 推导）
     phaseEndsAt: 0,
     serveTo: 0,       // 下一次发球朝向哪一队（0 = 发给左队）
@@ -1144,6 +1149,11 @@ function launchBall(room) {
 
 function startMatch(room) {
   room.score = [0, 0];
+  room.matchNo += 1;
+  room.matchId = `${room.code}-${room.matchNo}`;
+  room.missLog = [];
+  room.lastMissApproach = Object.create(null);
+  room.substep = -1;
   room.paddles = room.slots.map((s) => (s.span[0] + s.span[1]) / 2);
   room.winner = -1;
   clearPowerups(room);           // 新一局清空场上道具与残留效果
@@ -1213,6 +1223,7 @@ function bounceOffPaddle(room, slot, b) {
     ? PADDLE_MARGIN + PADDLE_W + BALL_R + 0.5
     : room.W - PADDLE_MARGIN - PADDLE_W - BALL_R - 0.5;
   room.lastHitter = slot;
+  delete room.lastMissApproach[b.id];
   room.events.push(`h${slot}`);
   if (boosted) room.events.push(`y${slot}`);   // 这一板是超高速，音效要听得出不一样
 }
@@ -1384,9 +1395,11 @@ function stepOneBall(room, b) {
   const rightFace = room.W - PADDLE_MARGIN - PADDLE_W;
 
   if (b.vx < 0 && b.x - BALL_R <= leftFace && b.x > PADDLE_MARGIN - 30) {
-    hitEdgePaddles(room, b, 'left');
+    const hit = hitEdgePaddles(room, b, 'left');
+    if (!hit) recordMissApproach(room, b, 'left', leftFace);
   } else if (b.vx > 0 && b.x + BALL_R >= rightFace && b.x < room.W - PADDLE_MARGIN + 30) {
-    hitEdgePaddles(room, b, 'right');
+    const hit = hitEdgePaddles(room, b, 'right');
+    if (!hit) recordMissApproach(room, b, 'right', rightFace);
   }
 
   // ★ 幻影球：墙和拍子都照常（不然对手一眼就看出它是穿模的幽灵），
@@ -1580,7 +1593,72 @@ function isWin(my, foe) {
   return my >= WIN_SCORE && my - foe >= WIN_MARGIN;
 }
 
+function recordMissApproach(room, ball, edge, faceX) {
+  const paddles = [];
+  let closest = null;
+  for (let slot = 0; slot < room.N; slot += 1) {
+    if (room.slots[slot].edge !== edge) continue;
+    const half = paddleHalf(room, slot);
+    const centerDelta = Math.abs(ball.y - room.paddles[slot]);
+    const margin = centerDelta - half - BALL_R;
+    const paddle = {
+      slot,
+      team: room.slots[slot].team,
+      y: r1(room.paddles[slot]),
+      half: r1(half),
+      centerDelta: r1(centerDelta),
+      catchMargin: r1(margin),
+    };
+    paddles.push(paddle);
+    if (!closest || margin < closest.catchMargin) closest = paddle;
+  }
+  if (!closest) return;
+  const previous = room.lastMissApproach[ball.id];
+  if (previous && previous.edge === edge && previous.closest.catchMargin <= closest.catchMargin) return;
+  room.lastMissApproach[ball.id] = {
+    ballId: ball.id,
+    tick: room.tick,
+    substep: room.substep,
+    serverTime: room.serverTime,
+    edge,
+    faceX,
+    ball: { x: r1(ball.x), y: r1(ball.y), vx: r1(ball.vx), vy: r1(ball.vy) },
+    paddles,
+    closest,
+  };
+}
+
+/**
+ * 记录一次失分时服务端实际使用的球 / 拍子位置。
+ * @param {object} room 当前房间
+ * @param {number} concededBy 失分队伍
+ * @param {object} ball 出界球
+ * @returns {void}
+ */
+function recordMiss(room, concededBy, ball) {
+  const id = room.missLog.length + 1;
+  room.missLog.push({
+    id,
+    matchId: room.matchId,
+    serverTime: room.serverTime,
+    tick: room.tick,
+    substep: room.substep,
+    scorer: 1 - concededBy,
+    concededBy,
+    ball: {
+      id: ball ? ball.id : null,
+      x: ball ? r1(ball.x) : null,
+      y: ball ? r1(ball.y) : null,
+      vx: ball ? r1(ball.vx) : null,
+      vy: ball ? r1(ball.vy) : null,
+    },
+    approach: ball ? (room.lastMissApproach[ball.id] || null) : null,
+  });
+  if (ball) delete room.lastMissApproach[ball.id];
+}
+
 function afterGoal(room, concededBy, ball) {
+  recordMiss(room, concededBy, ball);
   // ★ 先把这个漏掉的球从场上拿走。剩下的球继续在场上飞 ——
   //   "一回合要所有球都没接住才重发"就体现在这里。
   if (ball) {
@@ -1871,6 +1949,7 @@ function stepRoom(room, now) {
 
   // playing：先按细分的固定步长推进，再判定
   for (let i = 0; i < SUBSTEPS; i += 1) {
+    room.substep = i;
     stepPaddles(room, SUB_DT);
     if (room.phase !== 'playing') break;   // 中间可能因得分切换了阶段
     stepBalls(room, SUB_DT);
@@ -1942,6 +2021,8 @@ function broadcastState(room) {
     // ★ 这一项**按队过滤**，见函数末尾那句 —— 不在这个对象字面量里。
     bs: null,
     s: room.score,
+    mi: room.matchId,
+    mr: phase === 'over' ? room.missLog : null,
     k: room.tick,
     wn: room.winner,
     pr: room.players.map((p) => (isPresent(p) ? 1 : 0)),
