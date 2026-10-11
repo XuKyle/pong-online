@@ -1,0 +1,13 @@
+# 依赖（对方 `npm install` 即可；zip 交接包里我把它一起打进去了，省一次联网）
+node_modules/
+
+# 探针/调试产物
+*.log
+# 如果你把探针临时目录指到项目里（PROBE_TMP=.），profile 会落在这儿
+pong-probe/
+.edge*/
+
+# 编辑器
+.vscode/
+.idea/
+.DS_Store
