@@ -1,0 +1,465 @@
+  :root {
+    --bg: #f4f6fa;
+    --card: #ffffff;
+    --line: #e2e7f0;
+    --text: #1c2434;
+    --muted: #6b7890;
+    --faint: #97a3b8;
+    --accent: #2f6fd0;
+    --accent-ink: #ffffff;
+    --ok: #1f8a54;
+    --warn: #b7791f;
+    --bad: #c0392b;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+                 "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    -webkit-text-size-adjust: 100%;
+  }
+  .wrap { max-width: 940px; margin: 0 auto; padding: 16px 14px 40px; }
+
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 12px; margin-bottom: 14px; flex-wrap: wrap;
+  }
+  .brand { font-size: 16px; font-weight: 500; letter-spacing: .2px; }
+  .brand span { color: var(--faint); font-weight: 400; font-size: 13px; margin-left: 6px; }
+  .badge {
+    font-size: 12px; padding: 4px 10px; border-radius: 999px;
+    border: 1px solid var(--line); background: #fff; color: var(--muted);
+    white-space: nowrap;
+  }
+  .badge.ok { color: var(--ok); border-color: #bfe3cd; background: #f0faf4; }
+  .badge.warn { color: var(--warn); border-color: #f0dfb8; background: #fdf8ec; }
+  .badge.bad { color: var(--bad); border-color: #f0c8c2; background: #fdf1ef; }
+
+  /* 顶部右侧控件组。画布是定宽 100% + aspect-ratio，高度不受页眉影响，
+     所以这里多放一个控件不会连带压到画面尺寸。 */
+  .hright { display: flex; align-items: center; gap: 8px; }
+  .soundbtn {
+    font: inherit; font-size: 15px; line-height: 1; cursor: pointer;
+    padding: 5px 9px; border-radius: 8px;
+    border: 1px solid var(--line); background: #fff; color: var(--muted);
+  }
+  .soundbtn:hover { border-color: #cfd8e6; }
+  .soundbtn.off { opacity: .6; }
+  /* 暂停中：按钮变成「继续」并高亮，让"现在停着"一眼可见。
+     沿用 .soundbtn 的尺寸与响应式规则，所以手机上它自动就是 36×36 的可点面积。 */
+  .soundbtn.active { border-color: var(--accent); color: var(--accent); background: #eef4ff; }
+
+  .stage {
+    position: relative; margin: 0 auto; max-width: 940px;
+    /* 宽高比由 JS 按当前场地写进 --ar（coop 的球台比经典模式高得多）。
+       同时按视口高度反推一个最大宽度 —— 不然竖着的场地会顶出屏幕，
+       玩家得滚动才能看见自己那半场。
+       --reserve 是"页眉 + 下面那堆面板"占掉的高度：手机上那些面板被隐藏了，
+       预留高度跟着调小，球场就能大一圈（见文件末尾的窄屏块）。
+       ★ 桌面端**不覆盖**这个变量，所以还是 210px，和加手机端之前逐像素一致。 */
+    --reserve: 210px;
+    width: min(100%, calc((100vh - var(--reserve)) * var(--ar, 1.6)));
+    aspect-ratio: var(--ar, 1.6);
+    border-radius: 12px; overflow: hidden;
+    background: #0d1220; border: 1px solid #1b2540;
+  }
+  canvas { display: block; width: 100%; height: 100%; touch-action: none; }
+
+  .overlay {
+    position: absolute; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(9, 13, 24, .84);
+    padding: 18px; text-align: center;
+    /* ★ 必须能滚：九宫格把菜单从 471px 撑到 727px，`align-items:center` 在矮视口里
+       会把面板**顶部推到负数**（实测 1280×700 → panelTop = -61.7），且不是滚动容器
+       ⇒ 标题和说明**永远看不见也够不着**。改成可滚 + 面板够高时顶部对齐。 */
+    overflow-y: auto;
+  }
+  /* 面板比视口高时不许居中（居中等价于把上半截切掉）。顶部对齐、底部留白仍归 padding，
+     面板放得下时原来的居中也不变 —— 用的是 auto 外边距，不用 :has 判"放不放得下"。
+     ★ 只给 margin-top:auto，**不能写 margin:auto**：写 auto 会把底部的 76px 安全留白
+       一起吃掉（竖屏提示条正好压到菜单最后几个按钮上）。 */
+  .overlay:has(.panelbox) { align-items: flex-start; }
+  .overlay:has(.panelbox) .panelbox { margin-top: auto; }
+  .overlay.hidden { display: none; }
+  .panelbox { width: 100%; max-width: 380px; color: #e8eefb; }
+  .panelbox h2 { font-size: 17px; font-weight: 500; margin: 0 0 6px; }
+  .panelbox p { font-size: 13px; color: #93a3bf; margin: 0 0 16px; line-height: 1.6; }
+  .panelbox .hint { font-size: 12px; color: #6f7f9c; margin-top: 14px; }
+
+  button {
+    font: inherit; font-size: 14px; cursor: pointer;
+    border-radius: 8px; border: 1px solid transparent;
+    padding: 10px 16px; transition: filter .12s;
+  }
+  button:active { filter: brightness(.94); }
+  button:disabled { opacity: .5; cursor: default; }
+  .primary { background: var(--accent); color: var(--accent-ink); width: 100%; }
+  .ghost { background: #1a2440; color: #cfdcf3; border-color: #2b3a5e; }
+  .ghost:hover { background: #223055; }
+
+  .joinrow { display: flex; gap: 8px; margin-top: 10px; }
+  input[type=text] {
+    flex: 1; min-width: 0; font: inherit; font-size: 15px;
+    letter-spacing: 3px; text-transform: uppercase; text-align: center;
+    padding: 10px 12px; border-radius: 8px;
+    border: 1px solid #2b3a5e; background: #131c30; color: #e8eefb;
+    outline: none;
+  }
+  input[type=text]:focus { border-color: var(--accent); }
+  input[type=text]::placeholder { letter-spacing: 1px; color: #55647f; }
+
+  .code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 34px; letter-spacing: 8px; color: #7db4ff;
+    margin: 4px 0 14px; text-indent: 8px;
+  }
+  .waitdot { display: inline-block; animation: blink 1.4s infinite; }
+  @keyframes blink { 0%,100% { opacity: .25; } 50% { opacity: 1; } }
+
+  /* 菜单里的分隔与难度选择 */
+  .divider {
+    display: flex; align-items: center; gap: 8px;
+    margin: 16px 0 10px; color: #5f6f8c; font-size: 12px;
+  }
+  .divider::before, .divider::after { content: ""; flex: 1; height: 1px; background: #2b3a5e; }
+  .segrow { display: flex; gap: 6px; margin-top: 8px; }
+  .seglabel { font-size: 12px; color: #5f6f8c; text-align: left; }
+  /* 两个 AI 入口并排 —— 分成两行会把菜单拉得太长，并排也更好比较 */
+  .duorow { display: flex; gap: 8px; margin-top: 10px; }
+  .duorow > button { flex: 1; min-width: 0; }
+
+  /* ---- 拍子皮肤（颜色 = 技能） ---- */
+  /* 四个色块并排。色块本身就是"拍子长什么样"的缩略图，比写四个色名直观。 */
+  .skinrow { display: flex; gap: 6px; margin-top: 8px; }
+  .skinrow .swatch {
+    flex: 1; min-width: 0; display: flex; flex-direction: column;
+    align-items: center; gap: 4px; padding: 7px 0 6px;
+    font-size: 11px; line-height: 1.15;
+    border-radius: 8px; border: 1px solid #2b3a5e; background: #131c30; color: #9fb0cc;
+  }
+  .skinrow .swatch i {
+    display: block; width: 11px; height: 22px; border-radius: 4px;
+    background: #8a93a6; border: 1px solid rgba(0, 0, 0, .35);
+  }
+  .skinrow .swatch.on { border-color: var(--accent); background: #1b2b4a; color: #dbe8ff; }
+
+  /* ---- 选拍子九宫格 ---- */
+  /* 九种皮肤用一个 3 列的网格排开。★ 为什么用网格而不是横排：
+     横排到第 9 个要么换行成一条歪歪扭扭的长队，要么把每块压到 40px 宽 —— 两种在手机上都点不准。
+     网格每块至少 100px 宽（手机 390 宽时是 3 列 × ~110），手指绝对点得到。
+     ★ 每块里**必须**带技能说明：九个技能没法用一行小字讲完，
+       而玩家在"选"的这一刻正需要知道它干什么。 */
+  .skinpick-head { font-size: 13px; color: var(--muted); margin: 14px 0 8px; }
+  .skingrid {
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 7px; margin-top: 2px;
+  }
+  .skingrid .sp {
+    display: flex; flex-direction: column; gap: 5px; text-align: left;
+    padding: 8px 9px 9px; cursor: pointer;
+    border-radius: 10px; border: 1px solid #2b3a5e; background: #131c30;
+    color: #9fb0cc; font: inherit; font-size: 12px;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .skingrid .sp:hover { background: #1a2440; }
+  .skingrid .sp.on { border-color: var(--accent); background: #1b2b4a; color: #dbe8ff; }
+  .skingrid .sp-bar {
+    display: block; width: 100%; height: 8px; border-radius: 4px; background: #8a93a6;
+    border: 1px solid rgba(0, 0, 0, .35);
+  }
+  .skingrid .sp-name { font-size: 12px; font-weight: 500; }
+  .skingrid .sp-tip { font-size: 11px; line-height: 1.35; color: var(--muted); }
+  .skingrid .sp.on .sp-tip { color: #b9cbe8; }
+  /* ★ 这两个类名是**为了兼容探针**而留在网格上的（`.skinrow` / `.swatch`，
+     见 index.html 里 buildSkinPicker 的注释）。旧规则 `.skinrow .swatch i`
+     会把里面那条色带压成 11×22 的竖条 —— 新网格要的是通栏横条。
+     权重一样（0,2,1 vs 0,2,1）但这里在文件后面，所以后写者胜；
+     仍然显式写出来，免得以后有人搬动 CSS 顺序就静默变成竖条。 */
+  .skingrid .sp-bar, .skingrid.skinrow .swatch i.sp-bar {
+    width: 100%; height: 8px; border-radius: 4px;
+  }
+  .skinrow .swatch { align-items: stretch; }
+  /* 桌面端（`.panelbox` 只有 380px 宽、鼠标精确点击）把九宫格压紧一点：
+     面板 727px 高时在 1280×820 上也放不下（76+727+76 > 820），菜单会被迫贴顶。
+     压缩后 3 行说明格少约 110px，1280 档恢复"放得下就居中"。
+     ★ 只动间距与字号，不动 `grid-template-columns`（4 列会挤到每格 88px，
+       说明文字换行更多、反而更高 —— 这条实测过）。 */
+  @media (min-width: 461px) {
+    .skingrid { gap: 6px; }
+    .skingrid .sp { padding: 6px 8px 7px; gap: 4px; }
+    .skingrid .sp-tip { font-size: 10.5px; line-height: 1.28; }
+    .skinpick-head { margin: 11px 0 6px; }
+  }
+  /* 窄屏（手机竖屏菜单）：**仍然是 3 列**，只把格子压紧、说明缩一号。
+     ★ 第一版这里改成了 2 列 —— 实测反而更糟：9 格变 5 行，面板高度从 471px 涨到 899px，
+       320×568 上要滚 213px 才看得到底部。3 列虽然每格窄，但行数只有 3 行，总高度更小，
+       而且"九宫格"本身就是一眼能数完的形状。（触控面积仍然够：320 宽下每格约 90×70。） */
+  @media (max-width: 460px) {
+    .skingrid { gap: 5px; }
+    .skingrid .sp { padding: 6px 6px 7px; gap: 3px; }
+    .skingrid .sp-name { font-size: 11px; }
+    .skingrid .sp-tip { font-size: 10px; line-height: 1.25; }
+    .skinpick-head { margin: 10px 0 6px; }
+  }
+  /* ---- 图鉴（拍子 & 道具简介） ----
+     默认收起，只占一行；展开后是一列"色块 + 一句话"。
+     ★ 色块里放的是**真实的图标字符**（POWERUP_STYLE 的 label / SKIN_GLYPH），
+       用的是玩家在对局里真正会看到的那个字，不是另取一个替身。 */
+  .codex { margin-top: 12px; text-align: left; }
+  .codex-toggle {
+    display: block; width: 100%; text-align: left;
+    background: #131c30; border: 1px solid #2b3a5e; border-radius: 10px;
+    color: #9fb0cc; font-size: 12.5px; padding: 9px 12px; cursor: pointer;
+  }
+  .codex-toggle:hover { background: #1a2440; color: #cfdcf3; }
+  .codex-body { margin-top: 8px; }
+  .codex-title {
+    font-size: 11.5px; color: #6f7f9c; margin: 12px 0 7px; line-height: 1.45;
+  }
+  .codex-title:first-child { margin-top: 2px; }
+  .codex-row {
+    display: flex; align-items: flex-start; gap: 9px;
+    font-size: 12px; line-height: 1.45; padding: 3px 0; color: #b9cbe8;
+  }
+  .codex-chip {
+    flex: 0 0 auto; width: 24px; height: 24px; border-radius: 7px;
+    display: flex; align-items: center; justify-content: center;
+    border: 1px solid rgba(0, 0, 0, .35); color: #10182a;
+    font-style: normal; font-weight: 700; font-size: 12px;
+  }
+  .codex-chip .codex-glyph { font-weight: 700; }
+  .codex-text { flex: 1 1 auto; min-width: 0; }
+  .codex-text > b { color: #dbe8ff; font-weight: 500; }
+  .codex-desc { color: #8fa0bd; }
+  @media (max-width: 460px) {
+    .codex-toggle { font-size: 12px; padding: 8px 10px; }
+    .codex-row { font-size: 11.5px; gap: 8px; }
+    .codex-chip { width: 22px; height: 22px; border-radius: 6px; font-size: 11px; }
+  }
+
+  /* ★ 竖屏提示条（"把手机横过来玩"）是 position:fixed 贴在底部的，而菜单是可滚抽屉 ——
+     菜单最后几个按钮滚到底时会钻到它下面（实测有 3 个元素被压住）。
+     给抽屉补一段底部内边距，让"滚到底"停在提示条上面。
+     （这条规则在 @media (max-width:760px) 那一块里已经有一条 padding-bottom 了，
+     这里不重复加，改在那里统一处理。） */
+
+  /* ---- 技能按钮 ---- */
+  /* 浮在球场两侧、跟着自己的那条拍子上下走。
+     ★ position:fixed 而不是 absolute：.stage 有 overflow:hidden，挂在里面会被裁掉；
+       挂在 .wrap 上则要看它是不是定位祖先（横屏块里它正好是，桌面端不是）——
+       fixed 让包含块恒为视口，两种情况都不会被裁，也不用去改 .wrap 的 position
+       （那会顺带改掉 .solobar 的包含块，横屏布局会跟着变）。 */
+  .skillbtn {
+    position: fixed; z-index: 5; left: 0; top: 0;
+    width: 38px; height: 38px; padding: 0; margin: 0;
+    border-radius: 50%; border: 2px solid #2b3a5e; background: #101a2e;
+    color: #cfdcf3; font: 500 15px/1 ui-monospace, Menlo, Consolas, monospace;
+    display: none; align-items: center; justify-content: center;
+    overflow: hidden; cursor: pointer;
+    box-shadow: 0 2px 10px rgba(0, 0, 0, .45);
+    -webkit-tap-highlight-color: transparent;
+  }
+  .skillbtn.ready { border-color: currentColor; }
+  /* 冷却遮罩：从上往下退去的一圈暗色（--p 是"还剩多少"，1 → 0）。
+     ★ 用 conic-gradient 而不是再画一个 DOM —— 一个变量就能驱动，不需要每帧改结构。 */
+  .skillbtn::after {
+    content: ''; position: absolute; inset: -1px; border-radius: 50%;
+    background: conic-gradient(rgba(4, 8, 16, .8) calc(var(--p, 0) * 1turn), rgba(4, 8, 16, 0) 0);
+    pointer-events: none;
+  }
+  /* 别人的技能按钮：只当仪表盘看，不可点（点了也没有任何含义）。
+     缩一圈 + 去掉描边，一眼就能和"我自己那个能按的"区分开。 */
+  .skillbtn.foreign { pointer-events: none; opacity: .55; transform: scale(.84); }
+  .seg {
+    flex: 1; font: inherit; font-size: 13px; padding: 8px 0; cursor: pointer;
+    border-radius: 8px; border: 1px solid #2b3a5e; background: #131c30; color: #9fb0cc;
+  }
+  .seg:hover { background: #1a2440; }
+  .seg.on { border-color: var(--accent); background: #1b2b4a; color: #dbe8ff; }
+
+  /* 人机模式的常驻栏：solo 时画布上没有"等待对手"的遮罩可以挂退出按钮，
+     所以单独给一条，否则进了人机就再也回不去菜单。 */
+  .solobar {
+    display: flex; align-items: center; justify-content: space-between; gap: 10px;
+    margin-top: 12px; padding: 10px 14px; font-size: 13px; color: var(--muted);
+    background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+  }
+  .solobar b { color: var(--text); font-weight: 500; }
+  .smallbtn { padding: 7px 12px; font-size: 13px; }
+
+  .meters {
+    margin-top: 16px; background: var(--card);
+    border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px;
+  }
+  .meters h3 {
+    margin: 0 0 10px; font-size: 13px; font-weight: 500; color: var(--muted);
+    display: flex; align-items: center; gap: 8px;
+  }
+  .meters h3::after { content: ""; flex: 1; height: 1px; background: var(--line); }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(132px, 1fr)); gap: 10px 16px; }
+  .m .k { font-size: 11px; color: var(--faint); margin-bottom: 3px; }
+  .m .v { font-size: 15px; font-variant-numeric: tabular-nums; }
+  .m .v small { font-size: 11px; color: var(--faint); margin-left: 2px; }
+  .verdict {
+    margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line);
+    font-size: 13px; line-height: 1.65; color: var(--muted);
+  }
+  .verdict b { color: var(--text); font-weight: 500; }
+  .tip { font-size: 12px; color: var(--faint); margin-top: 10px; line-height: 1.6; }
+  .keys { font-family: ui-monospace, Menlo, Consolas, monospace; }
+
+  /* ---------- 手机端专属元素：电脑端一律不显示 ---------- */
+
+  /* 顶部延迟胶囊。桌面已经有完整的「链路实测」面板，再挂一个胶囊是重复信息。
+     默认 display:none 还有个好处：它**完全不参与桌面布局**，
+     连 .hright 的 gap 都不会被它撑开 —— 这是"不影响电脑端"的前提。 */
+  .ping { display: none; font-variant-numeric: tabular-nums; }
+  .rotatetip { display: none; }
+
+  /* 手机上浏览器会把划到边缘当成"后退"，玩到一半划一下页面就没了 */
+  html, body { overscroll-behavior: none; }
+  button, .seg, .soundbtn, input { -webkit-tap-highlight-color: transparent; }
+
+  /* ================= 手机端 · 窄屏（竖屏手机 / 很窄的窗口） =================
+     只在视口宽度 ≤760px 时生效。电脑端（1280px 那种）根本不匹配这一块，
+     所以下面怎么改都不可能碰到电脑端。 */
+  @media (max-width: 760px) {
+    .wrap { padding: 10px 10px 24px; }
+    header { margin-bottom: 10px; }
+    .brand { font-size: 15px; }
+    .brand span { display: none; }        /* 副标题「联机探针」手机上没必要占位 */
+    .stage { --reserve: 118px; }          /* 下面那堆面板都藏了，预留高度跟着收 */
+
+    .ping { display: inline-block; }
+
+    /* 桌面那个 27px 高的声音按钮在手机上偏小（手指点不准），撑到 36×36。
+       这是手机端特有的毛病：鼠标指针只要 1px 就能命中，手指需要几十像素。 */
+    .soundbtn { min-width: 36px; min-height: 36px; display: inline-flex;
+                align-items: center; justify-content: center; }
+
+    /* 链路实测面板整块收起。数据照常采集（renderMeters 还在跑），只是不显示。 */
+    .meters { display: none; }
+
+    /* 菜单改成整屏抽屉。竖屏时球场只有两百来像素高，而菜单内容有四百多像素，
+       硬塞进那个框里会被 .stage 的 overflow:hidden 裁掉一半。
+       改成 position:fixed 让它脱离球场、铺满屏幕并且能滚。
+       ★ .stage 确实是 overflow:hidden，但 fixed 元素在祖先没有 transform/filter 时
+         不会被祖先的 overflow 裁掉，所以这里能正常逃出来。 */
+    .overlay {
+      position: fixed; inset: 0;
+      overflow-y: auto; overscroll-behavior: contain;
+      -webkit-overflow-scrolling: touch;
+    }
+    .solobar { padding: 8px 12px; }
+  }
+
+  /* 竖屏才提示「横过来」——已经是横屏了还提示就荒唐了。
+     ★ 必须单独一条查询：667×375 这种横屏小机同时满足 max-width:760，
+       把这条混进上面那块的话，横屏时会一边提示横屏、一边按横屏排版，
+       自相矛盾而且探针也测不出来是哪条生效。 */
+  @media (max-width: 760px) and (orientation: portrait) {
+    .rotatetip {
+      /* ★ 必须 position:fixed 浮在上层。竖屏时菜单是整屏抽屉（也是 fixed），
+         提示留在文档流里会被抽屉整个盖住 —— 探针量得出它"有面积"、判定通过，
+         玩家却一个字都看不到。"量到了"不等于"看得见"，这里吃过一次亏。
+         顺便把提示做成底部悬浮条：手机上一眼就能看到，也不用滚。 */
+      position: fixed; left: 10px; right: 10px; z-index: 7;
+      bottom: calc(10px + env(safe-area-inset-bottom));
+      display: block;                     /* 基础样式里是 display:none，这里必须显式打开 */
+      margin: 0; padding: 9px 12px; text-align: center;
+      font-size: 12px; line-height: 1.5;
+      color: #cfdcf3; background: rgba(26, 36, 64, .95);
+      border: 1px solid #2b3a5e; border-radius: 12px;
+    }
+    /* 给抽屉留出提示条的高度，否则最后一个按钮会滑到它下面点不到 */
+    .overlay { padding-bottom: calc(76px + env(safe-area-inset-bottom)); }
+  }
+
+  /* ================= 手机端 · 横屏铺满 =================
+     条件写「横屏 + 视口高 ≤560 + 宽 ≤1100」，刻意不用 pointer:coarse ——
+     视口尺寸是无头探针能精确控制的量，而 pointer 媒体特性在仿真环境里不可靠，
+     一条没法在测试里复现的断点等于没测过。
+     代价：电脑上把窗口拖到又矮又窄（≤1100×560）也会进这套布局。那本来就是个
+     别扭的尺寸，进铺满布局只会更好用，不算回归。 */
+  @media (orientation: landscape) and (max-height: 560px) and (max-width: 1100px) {
+    .wrap { padding: 0; position: relative; }
+
+    /* 页眉改成浮在球场上的一条，不再占纵向高度 —— 省下的一百多像素全给球场。
+       pointer-events 要逐层放行：header 是 left:0;right:0 的整条，
+       手不放行的话这条透明横带会把球场右上角的触摸拖动全部吃掉。 */
+    header {
+      position: absolute; top: 0; left: 0; right: 0; z-index: 6;
+      margin: 0; padding: calc(6px + env(safe-area-inset-top)) 12px 6px;
+      justify-content: flex-end; pointer-events: none;
+    }
+    header .brand, header .hright { pointer-events: none; }
+    /* 只给真正要点的按钮放行；只读的徽章 / 延迟胶囊保持穿透。
+       ★ 它们**照常绘制** —— 透明的是"命中测试"，不是"绘制"。
+       所以"胶囊到底看不看得见"不能用 elementFromPoint 直接问：它会跳过 pe:none
+       的元素，拿到的是下面那一层（实测拿到 .overlay），看着像"被盖住了"。
+       探针里要先把该元素临时放行、问完立刻还原（probe-mobile / probe-crossplay 都这么做）。 */
+    header .soundbtn { pointer-events: auto; }
+    .brand { display: none; }
+
+    /* 球场是 1.6 的横条，手机横屏普遍是 2.1 左右，所以左右一定会剩两条。
+       留白底的话夜里玩就是"黑画面外镶一圈白"，很刺眼；把页面底色也换成球场色，
+       整屏看起来就是一整块。★ 不要把 .stage 的边框也一起去掉 ——
+       画布只画了上下墙（fillRect(0,0,W,3)），左右两条边是靠这个 border 划出来的，
+       去掉之后"球会在哪里出界"就没有视觉依据了。
+       只改 background，不动 border，所以 .stage 的矩形尺寸一个像素没变。 */
+    html, body { background: #0d1220; }
+    .stage {
+      border-radius: 0; max-width: none;
+      /* 球场铺满：高度吃满视口，宽度按球场比例反推，两侧留白居中。
+         dvh 才会跟着手机地址栏收放；不认识 dvh 的浏览器直接丢掉后一行、用前一行。 */
+      width: min(100vw, calc(100vh * var(--ar, 1.6)));
+      width: min(100vw, calc(100dvh * var(--ar, 1.6)));
+    }
+
+    .ping { display: inline-block; }
+    .meters { display: none; }
+
+    /* 铺满之后页眉浮在球场上，按钮太小会挡不住也点不准 */
+    .soundbtn { min-width: 36px; min-height: 36px; display: inline-flex;
+                align-items: center; justify-content: center; }
+    .badge { padding: 6px 10px; }
+
+    /* ★ 这条栏以前贴在**左下角**，而横屏时自己的拍子就贴着球场左缘 —— 正好压在
+       自己拍子的活动带上，玩着玩着手指还得绕开它。改到最右边，并拆成两排
+       （上排文字、下排按钮），于是它的横向占地只剩原来一半左右，不再侵占自己的半场。
+
+       为什么 right 是相对屏幕而不是球场：这里它是 absolute 且没有定位祖先，
+       包含块就是初始包含块（视口），`left:12px` 当年就是这么落在屏幕左缘的。
+       所以 `right: 8px` 会贴屏幕右缘 —— 球场两侧本来就有留白时，它整个落在留白里，
+       连对手的拍子都不挡。 */
+    .solobar {
+      position: absolute; left: auto; z-index: 6;
+      right: calc(8px + env(safe-area-inset-right));
+      bottom: calc(8px + env(safe-area-inset-bottom));
+      flex-direction: column; align-items: flex-end; gap: 4px;
+      margin: 0; padding: 6px 10px;
+      font-size: 11px; line-height: 1.25; white-space: nowrap;
+      background: rgba(13, 18, 32, .72); border-color: #2b3a5e; color: #cfdcf3;
+    }
+    .solobar .smallbtn { padding: 5px 10px; font-size: 11px; }
+    .solobar b { color: #e8eefb; }
+
+    /* 横屏只有 375~390 高，菜单按桌面那套行距会高过屏幕被裁掉。压紧行距，
+       并改成整屏可滚抽屉（同样是为了不被 .stage 的 overflow:hidden 裁掉）。 */
+    .overlay {
+      position: fixed; inset: 0;
+      align-items: flex-start; overflow-y: auto;
+      overscroll-behavior: contain; -webkit-overflow-scrolling: touch;
+      padding: 12px 16px calc(12px + env(safe-area-inset-bottom));
+    }
+    .panelbox { max-width: 560px; margin: 0 auto; }
+    .panelbox h2 { font-size: 15px; margin-bottom: 3px; }
+    .panelbox p { font-size: 12px; margin-bottom: 10px; line-height: 1.45; }
+    .panelbox .hint { font-size: 11px; margin-top: 9px; }
+    .divider { margin: 10px 0 8px; }
+    .code { font-size: 26px; letter-spacing: 6px; margin-bottom: 10px; }
+    button { padding: 9px 14px; }
+    .duorow, .joinrow, .segrow { margin-top: 8px; }
+  }

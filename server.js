@@ -16,6 +16,13 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const { WebSocketServer } = require('ws');
+const { isWin: evaluateWin, predictY: calculatePredictY } = require('./server/rules');
+const { createBotBehavior } = require('./server/bot');
+const { createPhysics } = require('./server/physics');
+const { createPowerupBehavior } = require('./server/powerups');
+const { createSkillBehavior } = require('./server/skills');
+const { createEffectClock } = require('./server/effects');
+const { createMatchLifecycle } = require('./server/match');
 
 const PORT = Number(process.env.PORT) || 3000;
 const HOST = '0.0.0.0';
@@ -365,10 +372,9 @@ const r2 = (v) => Math.round(v * 100) / 100;   // 拍子倍率这类小数要保
 // 球从一个变成多个（分裂球）之后，"哪个是哪个"必须能被客户端认出来。
 // id 只增不减，用来做跨快照的身份匹配；不要用数组下标当身份 ——
 // 下标会在某个球出界后整体前移。
-let ballSeq = 0;
+// 计数器已经跟着实现搬进 server/physics.js，这里只保留兼容入口。
 function makeBall(x, y) {
-  ballSeq += 1;
-  return { id: ballSeq, x, y, vx: 0, vy: 0 };
+  return physics.makeBall(x, y);
 }
 
 let tokenSeq = 0;
@@ -450,131 +456,30 @@ function normMode(mode) {
 }
 
 /**
- * 造一个 AI 玩家。刻意长得像真人玩家对象，好让 stepPaddles / 广播复用同一套代码。
- * speedBoost 是模式级的额外倍率（coop 里 AI 要覆盖整条 800px 的边，必须更快）。
+ * Create an AI player through the extracted behavior module.
+ *
+ * @param {number} level Requested difficulty index.
+ * @param {number} [speedBoost=1] Mode-level speed multiplier.
+ * @returns {object} AI player state compatible with a human player record.
  */
-function makeBot(level, speedBoost) {
-  const lv = clamp(level, 0, BOT_PRESETS.length - 1);
-  const cfg = BOT_PRESETS[lv];
-  return {
-    bot: true,
-    level: lv,
-    cfg,
-    token: null,
-    ws: null,
-    dir: 0,
-    since: Date.now(),
-    thinkAt: 0,       // 下次思考的时刻
-    aimErr: 0,        // 这一球的固定瞄准误差
-    chasing: false,   // 上一 tick 球是不是朝它飞 —— 用来判断"新的一球开始了"
-    chaseId: 0,       // 正在追的那个球的 id（多球时用来判断"换球了没"）
-    seen: [],         // 它**脑子里的球**：不隐形时每 tick 刷新，被隐形时冻结（见 botPerceive）
-    speedMul: cfg.speedMul * (speedBoost || 1),
-  };
+function makeBot(level, speedBoost = 1) {
+  return botBehavior.makeBot(level, speedBoost);
 }
 
+/**
+ * 造一个新房间（并把 AI 放进它该坐的槽位）。
+ * 房间状态形状与它的全部字段说明在 server/match.js。
+ */
 function createRoom(code, mode, level) {
-  const md = normMode(mode);
-  const court = COURT[md];
-  const slots = buildSlots(md, court.H);
-  const midOf = (s) => (s.span[0] + s.span[1]) / 2;
-  const room = {
-    code,
-    mode: md,
-    solo: md !== 'duel',      // 对手是不是 AI（外广播字段，历史探针在读）
-    coop: md === 'coop',
-    botLevel: md === 'duel' ? -1 : clamp(Number(level) || 0, 0, BOT_PRESETS.length - 1),
-    // ---- 场地与拍子布局（按房间，不再是全局常量）----
-    W: court.W,
-    H: court.H,
-    slots,                    // [{ edge, team, span }]
-    N: slots.length,          // 拍子槽位数：经典 2，coop 3
-    players: new Array(slots.length).fill(null),
-    paddles: slots.map(midOf),
-    ballSpeed0: md === 'coop' ? COOP_BALL_SPEED : BALL_SPEED_START,
-    // ★ 球是**数组**（分裂球会让场上同时存在多个球）。
-    //   每个球带一个稳定 id：客户端靠它把"上一帧的球"和"这一帧的球"对上号。
-    //   没有 id 时，一旦某个球出界被移出数组，后面所有球的位置都会整体错位，
-    //   客户端会把剩下的球从旧位置平滑地"滑"到新位置 —— 看起来像球在瞬移。
-    balls: [makeBall(court.W / 2, court.H / 2)],
-    score: [0, 0],
-    matchNo: 0,
-    matchId: '',
-    missLog: [],
-    lastMissApproach: Object.create(null),
-    substep: -1,
-    phase: 'countdown', // countdown | playing | over（对外的 waiting 由 paused/started 推导）
-    phaseEndsAt: 0,
-    serveTo: 0,       // 下一次发球朝向哪一队（0 = 发给左队）
-    tick: 0,
-    winner: -1,
-    started: false,   // 是否已经开过第一局；决定要不要初始化比分
-    paused: true,     // 缺人时冻结比赛，但不作废比分
-    // ★ 真人主动暂停（**任意一方按下即生效**，见 togglePause）。它与上面的 `paused`
-    //   刻意分成两个字段，因为语义完全不同：`paused` 是"缺人"的自动结果，
-    //   这个只由玩家按下产生。合成一个字段会立刻带来两个真问题：
-    //     ① 广播里的 ph 会变成 waiting，而客户端在 waiting 下**根本不画球** ——
-    //        一按暂停球就从画面上消失，看着像球被吞了；
-    //     ② "等对手回来"和"有人按了暂停"要给的提示语完全不一样。
-    userPaused: false,
-    pausedBy: -1,     // 是谁按的（**槽位号**，-1 = 当前没暂停）
-    frozenAt: 0,      // 上一次"冻结推进"的时刻（0 = 没在冻结）—— 见 stepRoom 里那句后移
-    // ---- 道具与临时效果 ----
-    powerups: [],                         // 场上道具 [{ x, y, type, bornAt }] —— 可以同时有多个
-    nextPowerupAt: Date.now() + PU_FIRST_MS,
-    lastHitter: -1,                       // 最后击球的**槽位**，决定球撞到的道具归哪一队
-    // 拍子长度倍率按**队**算，但它是由下面两个计时器**算出来**的，不是直接写的。
-    // ★ 拆成两个计时器是"多个效果能共存"的核心：加长和削短必须各自计时。
-    //   合用一个计时器时，对方在你加长中途削你一下，削短到期会把倍率复位成 1 ——
-    //   你那 8 秒的加长被顺带清掉，而且界面上没有任何提示，属于纯闷亏。
-    paddleMul: [1, 1],
-    growUntil: [0, 0],                    // "加长自己"到期时间（按队）
-    shrinkUntil: [0, 0],                  // "削短对方"到期时间（按队）
-    ballMul: 1,                           // 球速倍率：只缩放位移、不动 vx/vy，避免反复乘除漂移
-    ballUntil: 0,
-    freezeUntil: [0, 0],                  // 某队的拍子被冰冻到什么时候
-    doubleUntil: [0, 0],                  // 某队双倍得分到什么时候
-    // 某队的球被隐形到什么时候（**被隐形方**存这里：0 队吃了就写 1 队）。
-    // 按**队**而不是按球：隐形是"看不见场上所有球"，不是"某一个球隐形了"。
-    invisUntil: [0, 0],
-    shield: [0, 0],                       // 护盾剩余层数（不是时间制，是次数制）
-    curveUntil: 0,                        // 弧线球效果到期时间
-    curveSpin: 0,                         // 弧线角速度（rad/s，带符号 = 拐弯方向）
-    // ---- 皮肤与技能 ----
-    // ★ 全部按**槽位**存，不按队伍：coop 里左边两个人是同队，但各有各的技能和冷却。
-    //   这也是它们不能并进 applyPowerup 那套"按队生效"的数组里的原因。
-    skins: slots.map(() => SKIN_GRAY),    // 每个槽位选的皮肤（0 = 灰，没技能）
-    skillReadyAt: slots.map(() => 0),     // 冷却到期时刻（0 = 随时可放）
-    boostArmed: slots.map(() => false),   // 红色：已经蓄好力、等下一次击球
-    winds: [],                            // 正在刮的风 [{ dx, dy, until, seed }] —— 可以同时有多股
-    // ★ 蓝（粘球）：**按槽位**武装，和其他"下一次击球"类技能一个套路。
-    //   存布尔而不是时间戳：它表示"已经按下技能，等着粘下一板"，
-    //   真正计时的是球被粘住那一刻（b.stuck.until）。
-    stickArmed: slots.map(() => false),
-    // ★ 紫（乱弹）：按**槽位**（是"我自己接球变乱"，不是"这一队"）
-    chaosUntil: slots.map(() => 0),
-    // ★ 黑（黑洞）：场上可以同时存在多个洞（两个人都是黑拍子），所以是数组。
-    //   每一项 { x, y, team, until }：team 是**开洞那一方**，决定出口在哪半边。
-    holes: [],
-    // ★ 白（道具封锁）：**剩余层数**（按队）。对手吃到道具时消耗一层。
-    //   上限 BLOCK_MAX = 1 ⇒ 结构上就不可能叠加。
-    blockCharges: [0, 0],
-    // ★ 橙（减速）：某队拍子速度上限降到 SLOW_MUL 直到什么时候（按队，和冰冻一样）
-    slowUntil: [0, 0],
-    events: [],                           // 本轮离散事件，广播后清空（供前端出音效）
-    serverTime: Date.now(),
-    lastActivity: Date.now(),
-  };
-  // 把 AI 放进它该坐的槽位。它没有 ws，其余流程与真人玩家完全一致。
-  const boost = md === 'coop' ? COOP_BOT_SPEED_MUL : 1;
-  for (const i of BOT_SLOT[md]) room.players[i] = makeBot(room.botLevel, boost);
-  return room;
+  return match.createRoom(code, mode, level);
 }
 
-// 只算真人。机器人不算"活着" —— 否则人走了房间永远回收不掉，
-// 而且"双方都在"会永远成立，比分会一直空转。
+/**
+ * 只算真人。机器人不算"活着" —— 否则人走了房间永远回收不掉。
+ * 实现位于 server/match.js。
+ */
 function anyAlive(room) {
-  return room.players.some(isLive);
+  return match.anyAlive(room);
 }
 
 function send(ws, obj) {
@@ -583,282 +488,200 @@ function send(ws, obj) {
   }
 }
 
-// ---------- 道具与临时效果 ----------
-function clearPowerups(room) {
-  room.powerups = [];
-  room.nextPowerupAt = Date.now() + PU_FIRST_MS;
-  room.paddleMul = [1, 1];
-  room.growUntil = [0, 0];
-  room.shrinkUntil = [0, 0];
-  room.ballMul = 1;
-  room.ballUntil = 0;
-  room.freezeUntil = [0, 0];
-  room.doubleUntil = [0, 0];
-  room.invisUntil = [0, 0];
-  room.shield = [0, 0];
-  room.curveUntil = 0;
-  room.curveSpin = 0;
-  room.lastHitter = -1;
-  // ★ 黑洞、道具封锁、减速也属于"这一局的效果"，新一局跟着清。
-  //   （clearSkills 里也清了一遍 —— 两边都清是有意的：clearPowerups 只管道具侧，
-  //    clearSkills 管技能侧，谁先调用都不会漏掉这几个字段。）
-    room.holes = [];
-    room.blockCharges = [0, 0];
-    room.slowUntil = [0, 0];
-    // 局间"可以重新选拍子"的窗口：本局进过 over 并翻到下一局时打开，
-    //   球真的发出去时关上（见 broadcastState 开头与 pickSkin）。
-    room.reselectPending = false;
-  }
+// 只把**传输层的活**交给房间生命周期模块：ws 仍由连接管理持有，
+// 模块通过 player 记录读写它，并显式声明自己的副作用，不用直接摸 socket。
+function wsPlayer(ws, code, side, token) {
+  ws.player = { code, side, token };
+}
+
+// ---------- 道具、技能与效果时钟 ----------
+/**
+ * 领域模块在这里装配，依赖全部显式注入：下面那些同名函数只是兼容入口。
+ * 依赖方向是单向的 —— 道具 / 技能 / 时钟都不 require 本文件，也不互相 require。
+ */
+
+/** 下一个道具的类型。强制类型开关（FORCE_PU）按顺序循环，普通局随机。 */
+function pickPowerupType() {
+  return FORCE_PU
+    ? FORCE_PU[puSeq.i++ % FORCE_PU.length]
+    : Math.floor(Math.random() * POWERUP_N);
+}
+
+const powerupBehavior = createPowerupBehavior({
+  POWERUP_MOD_MS,
+  POWERUP_MAX,
+  POWERUP_R,
+  pickType: pickPowerupType,
+  PU_FIRST_MS,
+  PU_GAP_MS,
+  PU_LIFE_MS,
+  BALL_R,
+  MAX_BALLS,
+  BALL_FAST,
+  FREEZE_MS,
+  SHIELD_MAX,
+  CURVE_MS,
+  CURVE_SPIN,
+  INVIS_MS,
+  INVIS_FADE_MS,
+  PADDLE_GROW,
+  PADDLE_SHRINK,
+  clamp,
+  splitBall,
+});
+
+const skillBehavior = createSkillBehavior({
+  SKILL_CD_MS,
+  SKIN_N,
+  SKIN_GRAY,
+  SKIN_WIND,
+  SKIN_PHANTOM,
+  SKIN_BOOST,
+  SKIN_STICK,
+  SKIN_BLACKHOLE,
+  SKIN_CHAOS,
+  SKIN_BLOCK,
+  SKIN_SLOW,
+  WIND_MS,
+  PHANTOM_MS,
+  PHANTOM_ANGLE,
+  HOLE_R,
+  HOLE_LIFE_MS,
+  CHAOS_MS,
+  BLOCK_MAX,
+  SLOW_MS,
+  PADDLE_MARGIN,
+  PADDLE_W,
+  isPhantom,
+  makeBall,
+});
+
+// 效果时钟：到期清理与暂停冻结只有这一份实现（道具侧与技能侧都在这一趟里清）。
+const effectClock = createEffectClock({
+  refreshPaddleMul: powerupBehavior.refreshPaddleMul,
+});
 
 /**
- * 每局开始时把技能相关的东西清干净。
- * ★ 刻意**不动 room.skins** —— 那是玩家在菜单里选的，属于"这一场"而不是"这一局"，
- *   清掉的话第二局开始所有人都会变回灰板子。
- * ★ 冷却也一起清：新的一局从"技能就绪"开始，免得上一局的冷却跨局带到下一局。
+ * 房间与对局生命周期。ws 只作为玩家记录上的引用传进去，模块自己不 send，
+ * 需要回执时由 joinedPayload / handleRejoin 显式拿回去交给连接管理。
  */
+const match = createMatchLifecycle({
+  COURT,
+  BOT_PRESETS,
+  BOT_SLOT,
+  COOP_BOT_SPEED_MUL,
+  COOP_BALL_SPEED,
+  BALL_SPEED_START,
+  PU_FIRST_MS,
+  SKIN_GRAY,
+  SLOT_GRACE_MS,
+  OVER_HOLD_MS,
+  COUNTDOWN_MS,
+  SUBSTEPS,
+  SUB_DT,
+  CURVE_SPIN,
+  clamp,
+  isBot,
+  isLive,
+  isPresent,
+  isPhantom,
+  isWin,
+  normMode,
+  buildSlots,
+  normSkin,
+  makeBot,
+  makeBall,
+  r1,
+  clearPowerups,
+  clearSkills,
+  resetBall,
+  launchBall,
+  shiftDeadlines,
+  trackMods,
+  stepPaddles,
+  stepBalls,
+  stepPowerup,
+  applyPowerup,
+  debugShowcaseFx,
+  DEBUG_FX,
+  DEBUG_CURVE,
+  wsPlayer,
+});
+
+/** 每局开始时清空场上道具与残留效果。实现位于 server/powerups.js。 */
+function clearPowerups(room) {
+  powerupBehavior.clearPowerups(room);
+}
+
+/** 每局开始时清空技能冷却与蓄力（皮肤保留）。实现位于 server/skills.js。 */
 function clearSkills(room) {
-  room.winds = [];
-  room.holes = [];
-  for (let i = 0; i < room.N; i += 1) {
-    room.skillReadyAt[i] = 0;
-    room.boostArmed[i] = false;
-    room.stickArmed[i] = false;
-    room.chaosUntil[i] = 0;
-  }
-  for (let i = 0; i < 2; i += 1) {
-    room.blockCharges[i] = 0;
-    room.slowUntil[i] = 0;
-  }
+  skillBehavior.clearSkills(room);
 }
 
 /**
- * 把房间内所有"挂钟型"的截止时刻整体往后推 ms。
- *
- * ★ 为什么必须有这个函数：这些时间戳全是**绝对**的 Date.now()，而暂停期间挂钟照走。
- *   不推的话，"暂停两分钟"实际等于"所有效果都过期了"：
- *     · 吃到加长 / 双倍得分的人回来发现效果没了（白吃亏）；
- *     · 被冰冻的一方倒是自动解冻了（明明是别人吃到的东西替他解了围）；
- *     · 场上道具全部到寿消失，恢复后还得再等好几秒才刷出来。
- *   暂停的语义是"把**比赛时间**冻住"，所以这些截止时刻必须跟着一起冻。
- *
- * ★ 阶段截止时间 phaseEndsAt 在 countdown 阶段**不在本函数的职责内** ——
- *   stepRoom 在冻结期间每 tick 都会把它重设成"当前 + 倒计时长度"，恢复时又重设一次。
- *   所以这里只管 'over' 那个（冻结期间没人会去碰它，不后移的话解冻那一瞬间就直接开下一局）。
- *   'playing' 阶段这个字段当时用不到。
- *   ★ 实测确认过：把它改成"无条件后移"也不会出错 —— 因为把截止时刻后移"已经过去的那段
- *     时间"在定义上就等于"这段时间没走过"，是自纠正的。写成分情况只为让"谁负责它"有唯一答案。
+ * 把房间内所有"挂钟型"的截止时刻整体往后推。
+ * 实现位于 server/effects.js —— 暂停的冻结语义只有那一份。
  */
 function shiftDeadlines(room, ms) {
-  if (!(ms > 0)) return;
-  const bump = (t) => (t > 0 ? t + ms : 0);
-  if (room.phase === 'over') room.phaseEndsAt = bump(room.phaseEndsAt);
-  room.nextPowerupAt = bump(room.nextPowerupAt);
-  for (const u of room.powerups) u.bornAt += ms;
-  for (let i = 0; i < 2; i += 1) {
-    room.growUntil[i] = bump(room.growUntil[i]);
-    room.shrinkUntil[i] = bump(room.shrinkUntil[i]);
-    room.freezeUntil[i] = bump(room.freezeUntil[i]);
-    room.doubleUntil[i] = bump(room.doubleUntil[i]);
-    room.invisUntil[i] = bump(room.invisUntil[i]);
-  }
-  room.ballUntil = bump(room.ballUntil);
-  room.curveUntil = bump(room.curveUntil);
-  // 技能：冷却 / 在刮的风 / 幻影球的剩余时间，全都属于"比赛时间"，一样要冻住。
-  // 不冻的话，"暂停十秒"= 免费跳过十秒冷却 —— 谁先按暂停谁先转好技能。
-  for (let i = 0; i < room.N; i += 1) room.skillReadyAt[i] = bump(room.skillReadyAt[i]);
-  for (let i = 0; i < room.N; i += 1) room.chaosUntil[i] = bump(room.chaosUntil[i]);
-  for (const w of room.winds) w.until += ms;
-  for (const h of room.holes) h.until += ms;
-  for (let i = 0; i < 2; i += 1) room.slowUntil[i] = bump(room.slowUntil[i]);
-  for (const b of room.balls) {
-    if (b.phantomUntil) b.phantomUntil += ms;
-    // ★ 粘住的球也要一起后移：它就是"比赛时间还没走"的那一秒，
-    //   不后移的话暂停两秒回来球就自己飞走了 —— 而玩家全程没看见它动。
-    if (b.stuck) b.stuck.until += ms;
-  }
+  effectClock.shiftDeadlines(room, ms);
 }
 
 /**
- * 切换暂停。**任意一方按下都直接生效** —— 这不是投票，谁按谁说了算：
- * 两个人都能暂停，也都能恢复（对手暂停了你随时能按回去）。
- *
- * 这里只做状态与事件，不碰任何计时器 —— 冻结的进入 / 退出统一由 stepRoom 处理
- * （那样"缺人自动冻结"和"玩家主动暂停"走的是同一条路径，不会有一套被漏掉）。
- *
- * @param {object} room 房间
- * @param {number} slot 按下的槽位（只用于显示"是谁按的"）
- * @returns {boolean} 切换之后是否处于暂停
+ * 切换暂停。**任意一方按下都直接生效** —— 这不是投票，谁按谁说了算。
+ * 实现位于 server/effects.js。
  */
 function togglePause(room, slot) {
-  room.userPaused = !room.userPaused;
-  room.pausedBy = room.userPaused ? slot : -1;
-  // 两端都该听到"有人按了暂停" —— 不然对面会以为是自己卡了
-  room.events.push(room.userPaused ? 'pp' : 'pr');
-  return room.userPaused;
+  return effectClock.togglePause(room, slot);
 }
 
 // ---------- 技能 ----------
+// 施放、冷却与复位在 server/skills.js；下面保留同名兼容入口。
 /** 这个皮肤有没有主动技能（灰的没有） */
 function skinHasSkill(skin) {
-  return Number.isInteger(skin) && skin > SKIN_GRAY && skin < SKIN_N && SKILL_CD_MS[skin] > 0;
+  return skillBehavior.skinHasSkill(skin);
 }
 
-/**
- * 青：刮一阵风。
- * 风向 = 自己拍子中心 → 球场中心 的**单位向量**。
- *   · 拍子在左侧正中央 ⇒ 方向正好是 (+1, 0)，笔直往右吹；
- *   · 拍子在左上 ⇒ 方向是右下方。
- * 这正是需求描述的那个规则，而且是"从拍子指向中心"而不是"从中心指向拍子"。
- *
- * ★ 用**拍子的实时位置**而不是槽位中点：技能是"从我现在站的地方吹出去"，
- *   玩家把拍子挪到上方再按，风就该往右下走。用中点会让方向跟玩家的操作无关。
- */
+/** 青：刮一阵风。风向 = 拍子中心 → 球场中心的单位向量。 */
 function castWind(room, slot, now) {
-  const sl = room.slots[slot];
-  const px = sl.edge === 'left'
-    ? PADDLE_MARGIN + PADDLE_W / 2
-    : room.W - PADDLE_MARGIN - PADDLE_W / 2;
-  const py = room.paddles[slot];
-  let dx = room.W / 2 - px;
-  let dy = room.H / 2 - py;
-  const len = Math.hypot(dx, dy);
-  if (!(len > 1e-6)) return false;      // 理论上到不了（拍子在边上），留个守门
-  dx /= len;
-  dy /= len;
-  room.winds.push({ dx, dy, until: now + WIND_MS, seed: Math.random() * 1000 });
-  return true;
+  return skillBehavior.castWind(room, slot, now);
 }
 
-/**
- * 黄：放出一个幻影球。
- * 真球与幻影球各自朝两边偏 PHANTOM_ANGLE、速率不变 —— 见 PHANTOM_ANGLE 的注释，
- * 等速对称是"对手分不出哪个是假的"的前提。
- */
+/** 黄：放出一个幻影球（真球与幻影球等速对称偏开）。 */
 function castPhantom(room, slot, now) {
-  const team = room.slots[slot].team;
-  const src = room.balls.find((b) => !isPhantom(b));
-  if (!src) return false;
-  const speed = Math.hypot(src.vx, src.vy);
-  if (speed < 1) return false;          // 球还没发出去，没什么可迷惑的
-  const base = Math.atan2(src.vy, src.vx);
-  const sgn = Math.random() < 0.5 ? 1 : -1;
-  const aReal = base + sgn * PHANTOM_ANGLE;
-  const aFake = base - sgn * PHANTOM_ANGLE;
-  src.vx = Math.cos(aReal) * speed;
-  src.vy = Math.sin(aReal) * speed;
-  const ph = makeBall(src.x, src.y);
-  ph.vx = Math.cos(aFake) * speed;
-  ph.vy = Math.sin(aFake) * speed;
-  ph.phantom = team;                    // 归哪一队 —— 该队**看不到**它（见 broadcastState）
-  ph.phantomUntil = now + PHANTOM_MS;
-  room.balls.push(ph);
-  return true;
+  return skillBehavior.castPhantom(room, slot, now);
 }
 
-/**
- * 蓝：武装"下一次接球粘住"。真正的粘发生在 bounceOffPaddle 里
- * （见那里的 `room.stickArmed[slot]` 分支）—— 技能本身只是把开关打开。
- */
+/** 蓝：武装"下一次接球粘住"。真正的粘发生在 bounceOffPaddle 里。 */
 function castStick(room, slot) {
-  room.stickArmed[slot] = true;
-  return true;
+  return skillBehavior.castStick(room, slot);
 }
 
-/**
- * 黑：在己方靠中间的那半区随机开一个黑洞。
- *
- * ★ 区间是"自己这边的靠中半区"：左队 → x ∈ [0.25W, 0.50W]，右队整体镜像。
- *   用 **有效** 区间避开左右两条拍子列与上下墙 —— 洞开在拍子身上或者压着墙，
- *   玩家既看不清也容易误判，而且视觉上像是"洞卡在墙里"。
- * ★ y 也要留边：半径 HOLE_R 的洞贴着上下墙会露出一半。
- */
+/** 黑：在己方靠中间的那半区随机开一个黑洞。 */
 function castBlackhole(room, slot, now) {
-  const sl = room.slots[slot];
-  const left = sl.edge === 'left';
-  const x0 = left ? room.W * 0.25 : room.W * 0.75;
-  const x1 = left ? room.W * 0.50 : room.W * 0.50;
-  const lo = Math.min(x0, x1);
-  const hi = Math.max(x0, x1);
-  const pad = HOLE_R + 6;
-  const yLo = PADDLE_MARGIN + pad;
-  const yHi = room.H - PADDLE_MARGIN - pad;
-  const x = lo + Math.random() * (hi - lo);
-  const y = yLo + Math.random() * Math.max(1, yHi - yLo);
-  room.holes.push({
-    x, y, team: sl.team, until: now + HOLE_LIFE_MS,
-    // 视觉用：每个洞给一个固定相位，免得两个洞的呼吸完全同步
-    seed: Math.random() * 1000,
-  });
-  return true;
+  return skillBehavior.castBlackhole(room, slot, now);
 }
 
-/** 紫：开启 10 秒的"乱弹"状态（自己接球走随机角 + 大概率加速） */
+/** 紫：开启 10 秒的"乱弹"状态。 */
 function castChaos(room, slot, now) {
-  room.chaosUntil[slot] = now + CHAOS_MS;
-  return true;
+  return skillBehavior.castChaos(room, slot, now);
 }
 
-/**
- * 白：给对方挂一层"下一次吃到的道具无效"。
- * ★ 不能叠加：已经是满层就直接返回 false（**不消耗冷却**）——
- *   这样连按两下不会白烧 10 秒 CD，玩家不用猜"我这下浪费了没有"。
- */
+/** 白：给对方挂一层"下一次吃到的道具无效"（不叠加，也不消耗冷却）。 */
 function castBlock(room, slot) {
-  const team = room.slots[slot].team;
-  const foe = 1 - team;
-  if (room.blockCharges[foe] >= BLOCK_MAX) return false;
-  room.blockCharges[foe] = BLOCK_MAX;
-  return true;
+  return skillBehavior.castBlock(room, slot);
 }
 
-/** 橙：把对方整队的拍子速度上限降到 SLOW_MUL，持续 SLOW_MS */
+/** 橙：把对方整队的拍子速度上限降到 SLOW_MUL。 */
 function castSlow(room, slot, now) {
-  const foe = 1 - room.slots[slot].team;
-  room.slowUntil[foe] = Math.max(room.slowUntil[foe], now + SLOW_MS);
-  return true;
+  return skillBehavior.castSlow(room, slot, now);
 }
 
 /**
  * 放技能。返回 true 表示这次真的放出去了（冷却被消耗）。
- *
- * ★ 门禁按"技能能不能真的产生作用"来设，一条都不能省：
- *   · `room.started` —— 第一局还没开始时按下去没有任何意义；
- *   · `paused / userPaused` —— 比赛时间冻着的时候不该有任何操作生效（否则暂停期间
- *     放技能，恢复那一刻效果已经过半了）；
- *   · `phase === 'playing'` —— countdown 时球还没发出去（风没处吹、幻影球没有源球），
- *     over 时这一局已经结束了；
- *   · 冷却 —— 见 skillReadyAt；
- *   · 红色已经蓄着力时再按一次 —— 白烧 10 秒冷却，直接拒掉。
+ * 门禁：没开局 / 暂停中 / 非 playing 阶段 / 无技能 / 冷却中 / 红色已蓄力。
  */
 function castSkill(room, slot, now) {
-  if (!room.started) return false;
-  if (room.paused || room.userPaused) return false;
-  if (room.phase !== 'playing') return false;
-  const skin = room.skins[slot];
-  if (!skinHasSkill(skin)) return false;
-  if (room.skillReadyAt[slot] > now) return false;
-  if (skin === SKIN_BOOST && room.boostArmed[slot]) return false;
-
-  if (skin === SKIN_WIND) {
-    if (!castWind(room, slot, now)) return false;
-  } else if (skin === SKIN_PHANTOM) {
-    if (!castPhantom(room, slot, now)) return false;
-  } else if (skin === SKIN_BOOST) {
-    room.boostArmed[slot] = true;
-  } else if (skin === SKIN_STICK) {
-    if (!castStick(room, slot)) return false;
-  } else if (skin === SKIN_BLACKHOLE) {
-    if (!castBlackhole(room, slot, now)) return false;
-  } else if (skin === SKIN_CHAOS) {
-    if (!castChaos(room, slot, now)) return false;
-  } else if (skin === SKIN_BLOCK) {
-    if (!castBlock(room, slot)) return false;   // 已经封着对方了 → 不消耗冷却
-  } else if (skin === SKIN_SLOW) {
-    if (!castSlow(room, slot, now)) return false;
-  }
-  room.skillReadyAt[slot] = now + SKILL_CD_MS[skin];
-  room.events.push(`v${slot}${skin}`);   // v + 槽位 + 皮肤：前端按皮肤放不同的音效
-  return true;
+  return skillBehavior.castSkill(room, slot, now);
 }
 
 /**
@@ -874,39 +697,11 @@ function paddleHalf(room, slot) {
 
 /**
  * 应用一个道具。who / foe 都是**队伍**号 —— coop 里左边两个拍子属于同一队，
- * 所以"加长自己的拍子"会同时加长它的上半场和下半场两个拍子，这正是想要的效果。
+ * 所以"加长自己的拍子"会同时加长它的上半场和下半场两个拍子。
+ * 实现位于 server/powerups.js。
  */
 function applyPowerup(room, who, type, now) {
-  const foe = 1 - who;
-  if (type === 0) {
-    room.growUntil[who] = now + POWERUP_MOD_MS;     // 自己的拍子变长（只动自己的计时器）
-  } else if (type === 1) {
-    room.shrinkUntil[foe] = now + POWERUP_MOD_MS;   // 对方拍子变短（只动对方的计时器）
-  } else if (type === 2) {
-    room.ballMul = BALL_FAST;                        // 球加速
-    room.ballUntil = now + POWERUP_MOD_MS;
-  } else if (type === 3) {
-    // 冰冻：直接覆盖，不叠加时长（叠加会变成连续冻结，等于剥夺对方整队）
-    room.freezeUntil[foe] = Math.max(room.freezeUntil[foe], now + FREEZE_MS);
-  } else if (type === 4) {
-    room.shield[who] = Math.min(SHIELD_MAX, room.shield[who] + 1);        // 护盾 +1 层
-  } else if (type === 5) {
-    room.doubleUntil[who] = now + POWERUP_MOD_MS;    // 接下来 8 秒自己进球算两分
-  } else if (type === 6) {
-    // 弧线球：拐弯方向在吃到的那一瞬间就定下来，一整段持续同一个方向。
-    // 若每 tick 重掷方向，球会在空中左右乱抖，看着像掉帧而不是"飘"。
-    room.curveUntil = now + CURVE_MS;
-    room.curveSpin = Math.random() < 0.5 ? -CURVE_SPIN : CURVE_SPIN;
-  } else if (type === 7) {
-    splitBall(room);
-  } else if (type === 8) {
-    // 隐形球：**对方**被隐形，自己照常看得见。
-    // 用 Math.max 而不是直接覆盖：万一对方也刚吃到、正被隐形着，
-    // 不该被这一下"缩短"（道具只该让人更难受，不该替对方解围）。
-    room.invisUntil[foe] = Math.max(room.invisUntil[foe], now + INVIS_MS);
-  }
-  // 加长/削短是"算出来的"，这里立刻重算一次，别让倍率落后一 tick
-  refreshPaddleMul(room, now);
+  powerupBehavior.applyPowerup(room, who, type, now);
 }
 
 /**
@@ -921,517 +716,184 @@ function applyPowerup(room, who, type, now) {
  *     按固定角度偏转，保证它们一定分得开。
  *
  * 到上限就不分（见 MAX_BALLS）：再分下去就是弹幕了。
+ *
+ * 服务端兼容入口保留原函数签名，实现位于 server/physics.js。
  */
 function splitBall(room) {
-  // ★ 只数**真球**：幻影球是假的，它占了名额会让"分裂球"变成"吃了没反应"；
-  //   而且源球也必须是真球 —— 从一个幻影球上分裂出来，生出来的还是假的，
-  //   两个假球会一起穿透真球，观感非常诡异。
-  const real = room.balls.filter((b) => !isPhantom(b));
-  if (real.length >= MAX_BALLS) return false;
-  const src = real[0];
-  if (!src) return false;
-
-  const speed = Math.hypot(src.vx, src.vy) * SPLIT_SPEED_MUL;
-  if (speed < 1) return false;                     // 球还没发出去，没什么可分的
-
-  let dir = Math.atan2(src.vy, src.vx);
-  const mirror = Math.abs(Math.sin(dir)) > 0.2
-    ? -dir                                          // 常规：按水平轴镜像
-    : (Math.sin(dir) >= 0 ? dir + 0.6 : dir - 0.6);  // 近水平：硬掰开一个角度
-
-  const b = makeBall(src.x, src.y);
-  b.vx = Math.cos(mirror) * speed;
-  b.vy = Math.sin(mirror) * speed;
-  room.balls.push(b);
-  return true;
+  return physics.splitBall(room);
 }
 
 /**
  * 由两个计时器**算出**拍子倍率。抽成独立函数是为了让 applyPowerup 之后
- * 立刻就能拿到正确的倍率 —— 否则会有一 tick 的窗口里"效果生效了但拍子还是旧长度"，
- * 而客户端画拍子用的就是这个值，看起来就是"吃了加长但拍子没变长"。
+ * 立刻就能拿到正确的倍率 —— 否则会有一 tick 的窗口里"效果生效了但拍子还是旧长度"。
+ * 实现位于 server/powerups.js。
  */
 function refreshPaddleMul(room, now) {
-  for (let i = 0; i < 2; i += 1) {
-    const grow = room.growUntil[i] > now;
-    const shrink = room.shrinkUntil[i] > now;
-    if (!grow) room.growUntil[i] = 0;
-    if (!shrink) room.shrinkUntil[i] = 0;
-    // ★ 两个效果同时生效时**相乘**（1.65 × 0.62 ≈ 1.02），即"一加一减正好抵消"。
-    //   注意不能写成 Math.min（谁更极端谁赢）：那样一次削短会把正在生效的加长
-    //   一起抹掉，而且削短到期时还会把加长的剩余时间也清了 —— 纯闷亏。
-    room.paddleMul[i] = (grow ? PADDLE_GROW : 1) * (shrink ? PADDLE_SHRINK : 1);
-  }
+  powerupBehavior.refreshPaddleMul(room, now);
 }
 
-/** 效果到期复位。必须每 tick 调，否则道具会永久生效 */
+/**
+ * 效果到期复位。必须每 tick 调，否则道具会永久生效。
+ * 实现位于 server/effects.js —— 道具侧与技能侧的效果都在这一趟里清，
+ * 拆成两处写的话迟早会漏掉一个。
+ */
 function trackMods(room, now) {
-  refreshPaddleMul(room, now);
-  for (let i = 0; i < 2; i += 1) {
-    if (room.freezeUntil[i] && now >= room.freezeUntil[i]) room.freezeUntil[i] = 0;
-    if (room.doubleUntil[i] && now >= room.doubleUntil[i]) room.doubleUntil[i] = 0;
-    if (room.invisUntil[i] && now >= room.invisUntil[i]) room.invisUntil[i] = 0;
-  }
-  if (room.ballUntil && now >= room.ballUntil) {
-    room.ballMul = 1;
-    room.ballUntil = 0;
-  }
-  if (room.curveUntil && now >= room.curveUntil) {
-    room.curveUntil = 0;
-    room.curveSpin = 0;
-  }
-  // ★ 风也必须在这里到期清掉。少了这一句的后果**不是"风多吹一会儿"**：
-  //   stepBalls 是无条件遍历 room.winds 施力的，而 castWind 只往数组里 push、
-  //   从不删除 —— 于是每放一次风就永久多一股力，十分钟后场上的球会被一股
-  //   越积越大的合力直接甩出球场，而且完全看不出是哪一次技能造成的。
-  if (room.winds.length) {
-    const alive = room.winds.filter((w) => w.until > now);
-    if (alive.length !== room.winds.length) room.winds = alive;
-  }
-  // ★ 黑洞与减速也在这里到期清掉。和风同一个坑：`stepBalls` 是无条件遍历
-  //   `room.holes` 做判定的，只 push 不删的话场上会越积越多洞，
-  //   球一进场就会被一个"早就该消失的洞"吞掉，而且看不出是谁的技能造成的。
-  if (room.holes.length) {
-    const aliveH = room.holes.filter((h) => h.until > now);
-    if (aliveH.length !== room.holes.length) room.holes = aliveH;
-  }
-  for (let i = 0; i < 2; i += 1) {
-    if (room.slowUntil[i] && now >= room.slowUntil[i]) room.slowUntil[i] = 0;
-  }
+  effectClock.trackMods(room, now);
 }
 
 /**
  * 某一队**当前看到的球**有多不透明（1 = 完全看得见，0 = 完全看不见）。
- *
- * ★ 透明度在服务端算好再下发，而不是把时长发给客户端让它自己算。
- *   这条曲线有三个阶段（淡出 / 全隐 / 淡入），客户端再实现一遍就等于同一套数学
- *   写了两份，任何一边改了另一边的表现就会静默错位 —— 而错位恰好表现为
- *   "渐变没了、变成硬切"，正是这次要避免的东西。
- *
- *   曲线（elapsed = 已过去多久，remain = 还剩多久）：
- *     elapsed < FADE  → 1 - elapsed/FADE   （淡出：1 → 0）
- *     remain  < FADE  → 1 - remain/FADE    （淡入：0 → 1）
- *     中间            → 0                  （完全看不见）
- *   两头都留渐变、中间真的落到 0 —— 要的是"看不到"，不是"稍微变淡"。
- *   ★ 淡入那一段必须是 1 - remain/FADE。写成 remain/FADE 的话，
- *     曲线会变成 0 → 1 → 一路降回 0 → 最后一刻又跳回 1 来回抖，
- *     表面上"有透明度变化"，实际看是球闪了一下才回来。
+ * 三段曲线（淡出 / 全隐 / 淡入）在服务端算好后下发，客户端不再实现一遍。
+ * 实现位于 server/powerups.js。
  */
 function invisAlpha(room, team, now) {
-  const until = room.invisUntil[team];
-  if (!until || now >= until) return 1;
-  const remain = until - now;
-  const elapsed = INVIS_MS - remain;
-  if (elapsed < INVIS_FADE_MS) return clamp(1 - elapsed / INVIS_FADE_MS, 0, 1);
-  if (remain < INVIS_FADE_MS) return clamp(1 - remain / INVIS_FADE_MS, 0, 1);
-  return 0;
+  return powerupBehavior.invisAlpha(room, team, now);
 }
 
 /** 道具的生成 / 过期 / 被球碰到。只在 playing 阶段调用 */
 /**
- * 生成一个道具。
- * 位置落在中段区域：太靠边等于白送，太靠中间又会被乱球轻易蹭到。
- * ★ 多个并存时必须**互相错开**，否则两个圈会叠在一起，视觉上分不清是一个还是两个，
- *   而且球一穿过去会连着吃掉两个（观感上像是"一个道具给了两份效果"）。
+ * 生成一个道具。位置落在中段区域，且与场上其它道具互相错开。
+ * 实现位于 server/powerups.js。
  */
 function spawnPowerup(room, now) {
-  // ★ 场上球已经到上限时，不再生成分裂球 ——
-  //   否则只能眼睁睁看着一个吃不到的分裂球在那儿转，吃了还什么都没发生。
-  const atBallCap = room.balls.length >= MAX_BALLS;
-  let type = FORCE_PU
-    ? FORCE_PU[puSeq.i++ % FORCE_PU.length]
-    : Math.floor(Math.random() * POWERUP_N);
-  if (type === 7 && atBallCap) type = 0;
-  const minGap = POWERUP_R * 2 + 34;
-  let x = room.W * 0.26 + Math.random() * room.W * 0.48;
-  let y = 70 + Math.random() * (room.H - 140);
-  for (let tries = 0; tries < 20; tries += 1) {
-    const tooClose = room.powerups.some((u) => Math.hypot(u.x - x, u.y - y) < minGap);
-    if (!tooClose) break;
-    x = room.W * 0.26 + Math.random() * room.W * 0.48;
-    y = 70 + Math.random() * (room.H - 140);
-  }
-  return { x, y, type, bornAt: now };
+  return powerupBehavior.spawnPowerup(room, now);
 }
 
 /**
  * 道具的生成 / 过期 / 被球碰到。只在 playing 阶段调用。
- *
- * 场上道具是**数组**，可以同时存在最多 POWERUP_MAX 个：
- *   · 生成 —— 到点就补，不看场上还剩几个（这样节奏才是稳定的，而不是
- *     "捡完才排下一个"那种由玩家行为决定的忽快忽慢）；
- *   · 过期 —— 一次把所有到寿的都清掉，不是只清第一个；
- *   · 拾取 —— 每 tick 只吃**最近**的一个。两个圈偶尔重叠时按数组顺序吃会让人
- *     分不清自己吃的到底是哪个，按距离取最近才符合直觉。
+ * 实现位于 server/powerups.js。
  */
 function stepPowerup(room, now) {
-  // 生成
-  if (now >= room.nextPowerupAt) {
-    room.nextPowerupAt = now + PU_GAP_MS;
-    if (room.powerups.length < POWERUP_MAX) room.powerups.push(spawnPowerup(room, now));
-  }
-
-  // 过期
-  if (room.powerups.length) {
-    const alive = room.powerups.filter((u) => now - u.bornAt <= PU_LIFE_MS);
-    if (alive.length !== room.powerups.length) room.powerups = alive;
-  }
-
-  // 拾取：逐个球去找它够得着、且还没被吃掉的最近的那一个。
-  // ★ 必须逐个球遍历：多球时"某个球碰到了道具"和"另一个球碰到了另一个道具"
-  //   是完全可能同时发生的，只看 0 号球会漏掉后面那些球的碰撞。
-  const reach = BALL_R + POWERUP_R;
-  const eaten = [];
-  for (const ball of room.balls) {
-    let best = -1;
-    let bestD2 = Infinity;
-    for (let i = 0; i < room.powerups.length; i += 1) {
-      if (eaten.indexOf(i) >= 0) continue;
-      const u = room.powerups[i];
-      const dx = ball.x - u.x;
-      const dy = ball.y - u.y;
-      const d2 = dx * dx + dy * dy;
-      if (d2 <= reach * reach && d2 < bestD2) { bestD2 = d2; best = i; }
-    }
-    if (best < 0) continue;
-    eaten.push(best);
-    const u = room.powerups[best];
-    // 归属规则：谁最后把球打出去，这个道具就算哪一队的。直觉上最好理解。
-    // ★ lastHitter 是**槽位**，要折算成队伍 —— coop 里左边两个拍子都属于 0 队。
-    const lh = room.lastHitter;
-    const who = lh >= 0 && lh < room.N ? room.slots[lh].team : 0;
-    // ★ 白（道具封锁）：**被封锁方**吃到的道具直接作废，并且消耗掉一层封锁。
-    //   这一步必须挡在 applyPowerup 之前 —— 放在里面就晚了（效果已经生效）。
-    //   事件也换成"被封锁"那一款，否则玩家会看到"我明明吃到了却什么都没发生"
-    //   而对面则完全不知道自己的技能起效了。
-    if (room.blockCharges[who] > 0) {
-      room.blockCharges[who] -= 1;
-      room.events.push(`b${who}${u.type}`);   // b + 队伍 + 道具类型：前端放"被封"的音效
-    } else {
-      applyPowerup(room, who, u.type, now);
-      room.events.push(`u${who}${u.type}`);
-    }
-  }
-  if (eaten.length) {
-    // 从后往前删，避免下标前移漏删
-    eaten.sort((a, b) => b - a).forEach((i) => room.powerups.splice(i, 1));
-  }
-}
-
-function resetBall(room, serveTo) {
-  const b = makeBall(room.W / 2, room.H / 2);
-  room.balls = [b];
-  room.serveTo = serveTo;
-  room.lastHitter = -1;
-  // ★ 重新发球时隐形必须结束。
-  //   隐形是靠"球还在原来那条轨道上"才能预判的；一旦重新发球，
-  //   轨道本身换了，被隐形的人就彻底没有任何信息了 —— 那不是"难接"，
-  //   是"白送一分"。所以每次重新发球都把隐形清掉，
-  //   它的作用范围严格限定在"吃到它的那一个回合"。
-  room.invisUntil = [0, 0];
-  room.phase = 'countdown';
-  room.phaseEndsAt = Date.now() + COUNTDOWN_MS;
-}
-
-function launchBall(room) {
-  const dir = room.serveTo === 0 ? -1 : 1;   // 发给哪一队，球就往哪边飞
-  const angle = (Math.random() * 2 - 1) * (MAX_BOUNCE_ANGLE * 0.55);
-  const b = room.balls[0];
-  if (!b) return;
-  b.vx = dir * room.ballSpeed0 * Math.cos(angle);
-  b.vy = room.ballSpeed0 * Math.sin(angle);
-  // 发球方 = 接球方的对面。取那一队的第一个槽位当"最后击球者"，
-  // 这样球一发出去就撞到道具时，归属也有明确答案。
-  const servingTeam = 1 - room.serveTo;
-  room.lastHitter = room.slots.findIndex((s) => s.team === servingTeam);
-  room.phase = 'playing';
-}
-
-function startMatch(room) {
-  room.score = [0, 0];
-  room.matchNo += 1;
-  room.matchId = `${room.code}-${room.matchNo}`;
-  room.missLog = [];
-  room.lastMissApproach = Object.create(null);
-  room.substep = -1;
-  room.paddles = room.slots.map((s) => (s.span[0] + s.span[1]) / 2);
-  room.winner = -1;
-  clearPowerups(room);           // 新一局清空场上道具与残留效果
-  clearSkills(room);             // 技能冷却 / 蓄力 / 在刮的风也一起复位（皮肤保留）
-  resetBall(room, Math.random() < 0.5 ? 0 : 1);
-}
-
-/** 球拍反弹：出射角由"打中拍子哪个位置"决定，中间平着飞，边缘角度大 */
-function bounceOffPaddle(room, slot, b) {
-  const py = room.paddles[slot];
-  const half = paddleHalf(room, slot);
-  let rel = clamp((b.y - py) / half, -1, 1);
-  // ★ 弧线球期间，把"被带了一下"的观感做出来：出射角按当前弯曲方向偏一点点，
-  //   否则球会被拍子拍直，玩家根本看不出自己刚才吃到的效果还在生效。
-  if (room.curveSpin && room.curveUntil > room.serverTime) {
-    rel = clamp(rel + room.curveSpin * 0.9, -1, 1);
-  }
-  // ★★ 蓝（粘球）优先于一切：它把球**粘住**，这一板根本不产生反弹。
-  //   放在最前面是为了让"粘住"能压过红/紫——不然先算出射速再被粘住，
-  //   那一下的出速就白算了，表现上会出现"球弹出去的瞬间又被拽回来"。
-  //   只认真球、只认自己按了技能的那块拍子（和红色蓄力同一个理由）。
-  if (!isPhantom(b) && room.stickArmed[slot]) {
-    room.stickArmed[slot] = false;
-    b.stuck = {
-      slot,
-      until: room.serverTime + STICK_MS,
-      // 粘住期间每帧把球摆到这个相对位置（拍子中心再往外一点）
-      ox: room.slots[slot].edge === 'left' ? PADDLE_W / 2 + BALL_R + 1 : -(PADDLE_W / 2 + BALL_R + 1),
-      oy: clamp(b.y - py, -half, half),
-    };
-    b.vx = 0;
-    b.vy = 0;
-    room.lastHitter = slot;
-    room.events.push(`h${slot}`);
-    return;
-  }
-  // 红色技能蓄的力只对**真球**生效，而且只认**这块拍子**：
-  //   · 幻影球是自己放出去骗人的，撞回自己拍子上还要吃掉一次蓄力 —— 玩家看不见它，
-  //     只会觉得"我明明按了红色却什么都没发生"，属于纯闷亏；
-  //   · 别人把球打回来不该用掉我的蓄力（这是"我下次击球"的技能）。
-  const boosted = !isPhantom(b) && !!room.boostArmed[slot];
-  if (boosted) room.boostArmed[slot] = false;
-  const outDir = room.slots[slot].edge === 'left' ? 1 : -1;
-  // ★ 紫（乱弹）：10 秒内自己接球不再走常规反弹 —— 角度与速率都随机重掷。
-  //   仍然夹 BALL_SPEED_MAX：它是"改变球速的路径"之一，不夹会把球推过反隧穿前提。
-  const chaos = !isPhantom(b) && !boosted && room.chaosUntil[slot] > room.serverTime;
-  let speed;
-  let angle;
-  if (chaos) {
-    // 80% 加速（×1.00~1.35）、20% 微减速（×0.85~1.00）—— 期望值是净加速，
-    // 但偶尔慢一下让对手也摸不准节奏。需求原话就是"大概率是加速"。
-    const fast = Math.random() < 0.8;
-    const k = fast ? 1 + Math.random() * 0.35 : 0.85 + Math.random() * 0.15;
-    speed = Math.min(Math.hypot(b.vx, b.vy) * k, BALL_SPEED_MAX);
-    // 方向朝对方、±60°（和黑洞出洞同一套规则）
-    angle = (Math.random() * 2 - 1) * (CHAOS_HALF_DEG * Math.PI / 180);
-  } else {
-    speed = boosted
-      ? BOOST_SPEED
-      : Math.min(Math.hypot(b.vx, b.vy) * SPEEDUP_PER_HIT, BALL_SPEED_MAX);
-    angle = rel * MAX_BOUNCE_ANGLE;
-  }
-  b.vx = outDir * speed * Math.cos(angle);
-  b.vy = speed * Math.sin(angle);
-  // 位置推到拍子外侧，防止下一步又判定为碰撞而卡住
-  b.x = outDir > 0
-    ? PADDLE_MARGIN + PADDLE_W + BALL_R + 0.5
-    : room.W - PADDLE_MARGIN - PADDLE_W - BALL_R - 0.5;
-  room.lastHitter = slot;
-  delete room.lastMissApproach[b.id];
-  room.events.push(`h${slot}`);
-  if (boosted) room.events.push(`y${slot}`);   // 这一板是超高速，音效要听得出不一样
+  powerupBehavior.stepPowerup(room, now);
 }
 
 /**
- * 弧线球：把速度矢量旋转一个小角度。
- * ★ 用旋转而不是"加一个横向加速度"，是因为旋转是正交变换 ——
- *   速率严格不变，球不会因为拐弯越飞越快、也不会突破 BALL_SPEED_MAX。
- *   用加速度写的话每子步都在累加，几秒后球就快得没法接了。
- * ★ 分裂出来的球同样吃这个旋转（"受有关球的道具影响"）：
- *   两个球同向旋转但因为初始方向不同，会画出两条分开的弧线，观感很好。
+ * 球物理在这里装配。所有常量、纯房间辅助函数与结算回调都显式注入，
+ * server/physics.js 不反向 require 本文件。下面那些同名函数只是兼容入口。
+ */
+const physics = createPhysics({
+  BALL_R,
+  BALL_SPEED_START,
+  BALL_SPEED_MAX,
+  SPEEDUP_PER_HIT,
+  MAX_BOUNCE_ANGLE,
+  PADDLE_W,
+  PADDLE_MARGIN,
+  MAX_BALLS,
+  SPLIT_SPEED_MUL,
+  MIN_VX_RATIO,
+  UNSTICK_ANG_MIN,
+  UNSTICK_ANG_MAX,
+  UNSTICK_MIN_SPEED,
+  WIND_ACC,
+  BOOST_SPEED,
+  STICK_MS,
+  CHAOS_HALF_DEG,
+  HOLE_R,
+  HOLE_HALF_DEG,
+  COUNTDOWN_MS,
+  clamp,
+  isPhantom,
+  paddleHalf,
+  recordMissApproach,
+  afterGoal,
+});
+
+/**
+ * 重新发球：清掉隐形与最后击球方，回到倒计时阶段。
+ * 兼容入口 —— 实现位于 server/physics.js。
+ */
+function resetBall(room, serveTo) {
+  physics.resetBall(room, serveTo);
+}
+
+/**
+ * 发球：把中线上的球按接收方方向打出去，并把阶段切到 playing。
+ * 兼容入口 —— 实现位于 server/physics.js。
+ */
+function launchBall(room) {
+  physics.launchBall(room);
+}
+
+/**
+ * 开新一局：清零比分、重排拍子、清掉本局的道具与技能效果，然后重新发球。
+ * 实现位于 server/match.js。
+ */
+function startMatch(room) {
+  match.startMatch(room);
+}
+
+/**
+ * 球拍反弹：出射角由"打中拍子哪个位置"决定，中间平着飞，边缘角度大。
+ * 兼容入口 —— 实现与理由注释位于 server/physics.js。
+ */
+function bounceOffPaddle(room, slot, b) {
+  physics.bounceOffPaddle(room, slot, b);
+}
+
+/**
+ * 弧线球：把速度矢量旋转一个小角度（正交变换，速率严格不变）。
+ * 兼容入口 —— 实现与理由注释位于 server/physics.js。
  */
 function spinBall(room, b, dt) {
-  if (!room.curveSpin || room.curveUntil <= room.serverTime) return;
-  const a = room.curveSpin * dt;
-  const c = Math.cos(a);
-  const s = Math.sin(a);
-  const vx = b.vx * c - b.vy * s;
-  const vy = b.vx * s + b.vy * c;
-  b.vx = vx;
-  b.vy = vy;
+  physics.spinBall(room, b, dt);
 }
 
 /** 球是否撞上了贴在某条边上的某个拍子。撞到就弹一次并返回 true。 */
 function hitEdgePaddles(room, b, edge) {
-  for (let i = 0; i < room.N; i += 1) {
-    if (room.slots[i].edge !== edge) continue;
-    if (Math.abs(b.y - room.paddles[i]) <= paddleHalf(room, i) + BALL_R) {
-      bounceOffPaddle(room, i, b);
-      return true;
-    }
-  }
-  return false;
+  return physics.hitEdgePaddles(room, b, edge);
 }
 
 /**
- * 球与球的碰撞：等质量完全弹性碰撞。
- *
- * 等质量时结论非常干净 —— **交换沿连心线方向的速度分量**，垂直分量不动。
- * 所以不需要动量/能量方程，一行就能写：
- *     v1' = v1 - ((v1-v2)·n) n
- *     v2' = v2 - ((v2-v1)·n) n
- *
- * ★ 只处理"正在靠近"的那一对。这一条不是优化，是**必须的**：
- *   分裂球生成时两个球是同一个位置（距离 0），随后才分开。如果无脑把重叠的
- *   两球推开，刚分裂出来的一对会被立刻弹向奇怪的方向，看起来像分裂失败。
- *   "只在靠近时响应"天然放过了这种"重叠但正在分开"的情况，也正是台球的物理。
- *
- * ★ 碰完必须把基础速度夹回 BALL_SPEED_MAX。斜碰会改变各自的速度大小
- *   （只有正碰才两头都不变），不夹的话会慢慢漂到上限之上 ——
- *   而"子步位移远小于判定窗口"这个反隧穿前提，正是靠这个上限保证的。
+ * 球与球的碰撞：等质量完全弹性碰撞（等质量下交换沿连心线方向的速度分量）。
+ * 兼容入口 —— 实现与推导注释位于 server/physics.js。
  */
 function resolveBallCollisions(room) {
-  const balls = room.balls;
-  const minDist = BALL_R * 2;
-  for (let i = 0; i < balls.length; i += 1) {
-    for (let j = i + 1; j < balls.length; j += 1) {
-      const a = balls[i];
-      const b = balls[j];
-      // ★ 幻影球和任何球都不碰撞（包括另一个幻影球）—— 需求原话是"撞在一起就穿过去"。
-      //   这也是这套假象唯一的破绽，交付说明里如实写了。
-      if (isPhantom(a) || isPhantom(b)) continue;
-      // ★ 粘住的球也不参与碰撞：它贴在拍子上，别的球撞上来会把它推开。
-      if (a.stuck || b.stuck) continue;
-      let dx = b.x - a.x;
-      let dy = b.y - a.y;
-      const d2 = dx * dx + dy * dy;
-      if (d2 >= minDist * minDist) continue;
-      const d = Math.sqrt(d2);
-      // 完全重合：连心线没有定义，方向无从谈起 —— 直接放过。
-      // 分裂球生成的那一 tick 正好命中这里，等同"分开后再算"，是想要的行为。
-      if (d < 1e-6) continue;
-      dx /= d;
-      dy /= d;
-      // 沿连心线的相对速度。> 0 表示正在靠近
-      const approach = (a.vx - b.vx) * dx + (a.vy - b.vy) * dy;
-      if (approach <= 0) continue;
-      a.vx -= approach * dx;
-      a.vy -= approach * dy;
-      b.vx += approach * dx;
-      b.vy += approach * dy;
-      for (const q of [a, b]) {
-        const sp = Math.hypot(q.vx, q.vy);
-        if (sp > BALL_SPEED_MAX) {
-          q.vx = (q.vx / sp) * BALL_SPEED_MAX;
-          q.vy = (q.vy / sp) * BALL_SPEED_MAX;
-        }
-      }
-      room.events.push('cc');    // 撞球的音效（两种球互撞，和拍子音分开）
-    }
-  }
+  physics.resolveBallCollisions(room);
 }
 
 /**
  * 防"竖直卡死"：球的横向速度掉到 0 附近时，给它重新瞄一个方向。
- *
- * ★ 为什么必须防 —— 这不是"节奏不好看"，是**整局死锁**：
- *   球只在上下墙之间竖直弹时，它的 x 永远不变，于是永远碰不到任何拍子，
- *   这一回合永远不会结束（比分不动、也不会重新发球）。
- *   现实中两条来路：
- *     ① **等质量弹性碰撞**。连心线接近竖直时交换的是 vy，而 vx 会被
- *        `a.vx -= approach * dx` 顺手改掉一点（dx 是连心线的横向分量）——
- *        刚好抹平就是 0。更要命的是：**一旦变纯竖直，两个竖直球正碰
- *        只会互换 vy，vx 依然是 0** —— 这个状态是自锁的，不会自己恢复。
- *     ② **分裂球**。源球接近竖直时走"水平轴镜像"分支，新球的
- *        vx = 0.5 × 源球 vx，横向占比与源球完全一样 ⇒ 源球竖直，分出来的也竖直。
- *   （弧线球能把速度矢量旋转到接近竖直，所以这条路不是理论上的。）
- *
- * ★ 只旋转、**不改变速率**：速率大小是"反隧穿"论证的前提（子步位移必须远小于
- *   判定窗口，靠的就是 BALL_SPEED_MAX 这个上限）。在这里给它加速度会把那个
- *   前提弄脏，所以只换方向。重瞄角取 30°~60°：横向推进显著，同时又比纯水平
- *   更快产生上下变化，观感上是"球忽然拐了一下"，不是"球瞬移了"。
- *
- * ★ 判据用"占速率的比例"而不是绝对阈值：速率会一路涨到 900，
- *   固定阈值的含义会随球速漂移，写到后面就形同虚设。
+ * 兼容入口 —— 实现与原因分析位于 server/physics.js。
  *
  * @param {object} b 球
  * @returns {boolean} 真的重瞄了才返回 true（调用方据此统计）
  */
 function unstickBall(b) {
-  // ★ 粘住的球 vx=vy=0，正好命中下面那条"速率兜底"分支 —— 会被重瞄出去，
-  //   表现就是"刚粘住就被甩飞"。它本来就该停着，直接跳过。
-  if (b.stuck) return false;
-  const sp = Math.hypot(b.vx, b.vy);
-  // 正常情况：速率有效、横向占比够大 ⇒ 球正在横穿场地，一个字都别动
-  if (sp >= 1 && Math.abs(b.vx) >= sp * MIN_VX_RATIO) return false;
-
-  // 速率兜底：`sp ≈ 0` 的球（现有物理下达不到，因为速率只会变大或保持不变）
-  // 一旦出现就是永久停住，所以重瞄后至少得让它能横穿场地。
-  // 不做上限裁剪 —— 这里只换方向，速率是多少就还是多少。
-  const speed = Math.max(sp, UNSTICK_MIN_SPEED);
-  const sign = Math.random() < 0.5 ? -1 : 1;                  // 往左还是往右：随机
-  const ang = UNSTICK_ANG_MIN + Math.random() * (UNSTICK_ANG_MAX - UNSTICK_ANG_MIN);
-  // 上下倾向沿用原来的（该往上就还往上）；原本正好水平就随机给一个。
-  const vsign = b.vy < 0 ? -1 : (b.vy > 0 ? 1 : (Math.random() < 0.5 ? -1 : 1));
-  b.vx = sign * speed * Math.cos(ang);
-  b.vy = vsign * speed * Math.sin(ang);
-  return true;
+  return physics.unstickBall(b);
 }
 
 /**
  * 对场上每个球做一次防卡死检查，返回被重瞄的球数。
- * ★ 必须在 resolveBallCollisions **之后**调用：正是那次碰撞可能把球打成竖直，
- *   放在前面等于拿"碰撞前的速度"做判断，刚被打竖直的球要等下一个子步才被救。
+ * ★ 必须在 resolveBallCollisions **之后**调用。
  */
 function unstickBalls(room) {
-  let n = 0;
-  for (const b of room.balls) if (unstickBall(b)) n += 1;
-  return n;
+  return physics.unstickBalls(room);
 }
 
-/** 单个球的墙 / 拍子 / 出界判定。出界时会把球从场上移除并结算比分。 */
+/**
+ * 单个球的墙 / 拍子 / 出界判定。出界时会把球从场上移除并结算比分。
+ * 兼容入口 —— 实现与注释位于 server/physics.js。
+ */
 function stepOneBall(room, b) {
-  // ★ 粘住的球不参与任何碰撞与出界判定：它被"挂"在拍子上，
-  //   走这段会每子步被自己的拍子弹一次（表现上就是"粘不住，一直弹"）。
-  //   它的位置完全由 stepBalls 那段负责。
-  if (b.stuck) return;
-
-  // 上下墙
-  if (b.y - BALL_R < 0) {
-    b.y = BALL_R;
-    b.vy = Math.abs(b.vy);
-  } else if (b.y + BALL_R > room.H) {
-    b.y = room.H - BALL_R;
-    b.vy = -Math.abs(b.vy);
-  }
-
-  const leftFace = PADDLE_MARGIN + PADDLE_W;
-  const rightFace = room.W - PADDLE_MARGIN - PADDLE_W;
-
-  if (b.vx < 0 && b.x - BALL_R <= leftFace && b.x > PADDLE_MARGIN - 30) {
-    const hit = hitEdgePaddles(room, b, 'left');
-    if (!hit) recordMissApproach(room, b, 'left', leftFace);
-  } else if (b.vx > 0 && b.x + BALL_R >= rightFace && b.x < room.W - PADDLE_MARGIN + 30) {
-    const hit = hitEdgePaddles(room, b, 'right');
-    if (!hit) recordMissApproach(room, b, 'right', rightFace);
-  }
-
-  // ★ 幻影球：墙和拍子都照常（不然对手一眼就看出它是穿模的幽灵），
-  //   但出界**既不判分也不消耗护盾**（需求原话："不会因为这个球实际得分和失分"）。
-  //   直接返回，不往下走那段计分逻辑。
-  if (isPhantom(b)) {
-    if (b.x + BALL_R < 0 || b.x - BALL_R > room.W) removeBall(room, b);
-    return;
-  }
-
-  // 出界：先给护盾一次机会，挡不住才算失分
-  if (b.x + BALL_R < 0) {
-    if (!useShield(room, 0, b)) afterGoal(room, 0, b);
-  } else if (b.x - BALL_R > room.W) {
-    if (!useShield(room, 1, b)) afterGoal(room, 1, b);
-  }
+  physics.stepOneBall(room, b);
 }
 
 /**
  * 把一个球从场上拿走（出界 / 到寿）。**只给幻影球用** —— 真球的移除在 afterGoal 里，
  * 那条路径还要顺带结算比分。
- *
- * ★ 拿走之后必须检查"场上还有没有真球"。漏了这一步会让整局彻底卡死：
- *   真球已经出界、分数也结算过了，而幻影球出界又**不会**触发 afterGoal，
- *   于是没有任何一条路径会去重新发球 —— 比分不动、球也不再出现，这一局就死在那儿了。
+ * 兼容入口 —— 实现与死锁说明位于 server/physics.js。
  */
 function removeBall(room, b) {
-  const i = room.balls.indexOf(b);
-  if (i >= 0) room.balls.splice(i, 1);
-  if (room.phase !== 'playing') return;
-  if (room.balls.some((q) => !isPhantom(q))) return;   // 还有真球在飞，什么都不用做
-  resetBall(room, room.serveTo);
+  physics.removeBall(room, b);
+}
+
+/**
+ * 黑（黑洞）：球碰到自己开的洞就"穿"到对面靠中间的半区随机位置。
+ * 兼容入口 —— 实现与规则要点位于 server/physics.js。
+ */
+function checkBlackhole(room, b) {
+  return physics.checkBlackhole(room, b);
 }
 
 /**
@@ -1439,158 +901,28 @@ function removeBall(room, b) {
  * 顺序：先全部旋转+位移，再两两解球球碰撞，最后逐球做墙/拍子/出界。
  * ★ 碰撞必须放在全部位移之后：否则先动的球会拿"别人的旧位置"去判定，
  *   两个球会像穿过去一样互相漏掉。
+ * 兼容入口 —— 实现与注释位于 server/physics.js。
  */
-/**
- * 黑（黑洞）：球碰到自己开的洞就"穿"到对面靠中间的半区随机位置。
- *
- * ★ 三条要点：
- *   ① 只认**自己开的洞**对**所有球**生效 —— 洞是场地的一部分，不是谁的私产。
- *      但出口位置由**开洞方的队伍**决定（洞在左就在右边出），所以这里读 h.team。
- *   ② 速率严格保持（需求原话"速率和进入黑洞时相同"）：只重掷方向，不乘任何系数。
- *      也因此**不需要**再夹 BALL_SPEED_MAX —— 进来的速率本来就已经被夹过了。
- *   ③ 出洞方向是"朝对方"、±HOLE_HALF_DEG。以左队开洞为例：球从 x∈[0.25W,0.5W]
- *      的洞里进去，从 x∈[0.5W,0.75W] 出来，方向以**正右**为 0°、上下随机 ±60°。
- *
- * ★ 洞用完就消：一个洞只送走一个球。不然球会反复被同一个洞抛来抛去。
- */
-function checkBlackhole(room, b) {
-  if (!room.holes.length) return false;
-  const now = room.serverTime;
-  for (let i = 0; i < room.holes.length; i += 1) {
-    const h = room.holes[i];
-    if (h.until <= now) continue;
-    const dx = b.x - h.x;
-    const dy = b.y - h.y;
-    if (dx * dx + dy * dy > HOLE_R * HOLE_R) continue;
-
-    const speed = Math.hypot(b.vx, b.vy);
-    // 速率兜底：极低速的球（理论到不了）也给一个能飞出去的值，免得出洞就卡住
-    const sp = Math.max(speed, UNSTICK_MIN_SPEED);
-    // 出口：洞在**己方靠中半区**，出口在**对方靠中半区** —— 左右镜像。
-    const left = room.slots.find((s) => s.team === h.team);
-    const holeOnLeft = left ? left.edge === 'left' : true;
-    const x0 = holeOnLeft ? room.W * 0.50 : room.W * 0.25;
-    const x1 = holeOnLeft ? room.W * 0.75 : room.W * 0.50;
-    const pad = BALL_R + 4;
-    const yLo = pad;
-    const yHi = room.H - pad;
-    b.x = x0 + Math.random() * (x1 - x0);
-    b.y = yLo + Math.random() * Math.max(1, yHi - yLo);
-    // 方向：朝对方（洞在左 → 向右），±60°
-    const outDir = holeOnLeft ? 1 : -1;
-    const ang = (Math.random() * 2 - 1) * (HOLE_HALF_DEG * Math.PI / 180);
-    b.vx = outDir * sp * Math.cos(ang);
-    b.vy = sp * Math.sin(ang);
-    // 洞用完即消 —— 否则同一个洞会把球反复吞吐
-    room.holes.splice(i, 1);
-    room.events.push(`w${h.team}`);   // 黑洞音效
-    return true;
-  }
-  return false;
-}
-
 function stepBalls(room, dt) {
-  const mul = room.ballMul;
-  const winds = room.winds;
-  for (const b of room.balls) {
-    // ★★ 蓝（粘球）：先处理粘住的球，它走**完全不同**的一条路 ——
-    //   不施力、不旋转、不位移，只是被"挂"在自己拍子上。
-    //   放在最前面是为了让下面那些"施力 / 夹速率"的代码一行都不碰它：
-    //   给它加风、或者让它按自己的速度动，都会让"粘住"当场失效。
-    if (b.stuck) {
-      if (room.serverTime >= b.stuck.until) {
-        // 到点：朝正前方（自己这一侧的水平方向）以普通发球初速放出去。
-        // ★ 方向是**水平**，不是"朝球场中心" —— 需求原话是"向正前方释放"。
-        const sd = room.slots[b.stuck.slot];
-        const outDir = sd && sd.edge === 'left' ? 1 : -1;
-        b.stuck = null;
-        b.vx = outDir * BALL_SPEED_START;
-        b.vy = 0;
-        b.x = outDir > 0
-          ? PADDLE_MARGIN + PADDLE_W + BALL_R + 0.5
-          : room.W - PADDLE_MARGIN - PADDLE_W - BALL_R - 0.5;
-        room.events.push('hS');   // 释放音效，和普通击球区分开
-      } else {
-        // 粘住中：位置跟着拍子走（拍子动了球也跟着，这才是"粘"）
-        const sl = room.slots[b.stuck.slot];
-        const px = sl.edge === 'left'
-          ? PADDLE_MARGIN + PADDLE_W / 2
-          : room.W - PADDLE_MARGIN - PADDLE_W / 2;
-        b.x = px + b.stuck.ox;
-        b.y = room.paddles[b.stuck.slot] + b.stuck.oy;
-        b.vx = 0;
-        b.vy = 0;
-        continue;
-      }
-    }
-    spinBall(room, b, dt);        // 弧线球：先转向，再按新方向前进
-    // 风：给球加一个沿风向的加速度。顺风的球被推快、逆风的被拽慢、横穿的被推偏、
-    //   本来就慢的球会被吹得直接转向 —— 四种表现都是这一个式子的结果（见 WIND_ACC）。
-    for (let i = 0; i < winds.length; i += 1) {
-      b.vx += winds[i].dx * WIND_ACC * dt;
-      b.vy += winds[i].dy * WIND_ACC * dt;
-    }
-    // ★ 加完风必须把速率夹回上限：风是**唯一**能把球推过 BALL_SPEED_MAX 的路径，
-    //   而"子步位移远小于判定窗口"这个反隧穿前提正是靠这个上限保证的。
-    //   夹的是**速率**不是分量 —— 分量各夹各的会把方向掰弯，球会莫名其妙拐一下。
-    const sp = Math.hypot(b.vx, b.vy);
-    if (sp > BALL_SPEED_MAX) {
-      b.vx = (b.vx / sp) * BALL_SPEED_MAX;
-      b.vy = (b.vy / sp) * BALL_SPEED_MAX;
-    }
-    b.x += b.vx * mul * dt;
-    b.y += b.vy * mul * dt;
-    // ★ 黑（黑洞）：只认真球，判定放在位移之后（这样"这一子步里穿过洞"也能抓到）。
-    if (!isPhantom(b)) checkBlackhole(room, b);
-  }
-  resolveBallCollisions(room);
-  // ★ 紧跟碰撞之后：碰撞本身就能把球打成"纯竖直"（见 unstickBall），
-  //   不在这里救，球就会永远在上下墙之间竖弹、这一回合永远结束不了。
-  unstickBalls(room);
-  // 复制一份再遍历：出界的球会在 afterGoal 里被移出 room.balls，
-  // 直接遍历原数组会因为下标前移而漏掉后面的球。
-  for (const b of room.balls.slice()) {
-    if (room.phase !== 'playing') break;   // 期间可能因分出胜负/重发球切了阶段
-    // 幻影球到寿：悄悄消失，不算分（对手只会看到"球没了"）。
-    if (isPhantom(b) && b.phantomUntil && room.serverTime >= b.phantomUntil) {
-      removeBall(room, b);
-      continue;
-    }
-    stepOneBall(room, b);
-  }
+  physics.stepBalls(room, dt);
 }
 
 /**
  * 护盾：球马上要出界时消耗一层，把球弹回场内。
  * 参数是**队伍**号 —— coop 里护盾属于左边这一整队，两个人共享。
  * 返回 true 表示这次被挡下了，调用方不该再判失分。
+ * 兼容入口 —— 实现与注释位于 server/physics.js。
  */
 function useShield(room, side, ball) {
-  if (room.shield[side] <= 0) return false;
-  const b = ball || room.balls[0];
-  if (!b) return false;
-  room.shield[side] -= 1;
-
-  // 推回场内并反向。稍微提一点速，否则低速救球会贴着底线反复来回
-  b.x = side === 0 ? BALL_R + 2 : room.W - BALL_R - 2;
-  const speed = Math.min(Math.hypot(b.vx, b.vy) * 1.04, BALL_SPEED_MAX);
-  const angle = (Math.random() * 2 - 1) * MAX_BOUNCE_ANGLE * 0.6;
-  b.vx = (side === 0 ? 1 : -1) * speed * Math.cos(angle);
-  b.vy = speed * Math.sin(angle);
-  // 救球的人算最后击球方，撞到道具归他那一队
-  const own = room.slots.findIndex((s) => s.team === side);
-  room.lastHitter = own < 0 ? 0 : own;
-  room.events.push(`k${side}`);
-  return true;
+  return physics.useShield(room, side, ball);
 }
 
 /**
  * 乒乓球胜负判定：先到 11 分、且净胜 2 分。
- * 单独抽成纯函数是为了能验证边界 —— 真打满 11 分要好几十秒，
- * 而 10:10 之后的分支恰恰是最容易写错的地方（11:10 不结束、12:10 才结束）。
+ * 服务端兼容入口保留原函数签名，纯规则实现位于 server/rules.js。
  */
 function isWin(my, foe) {
-  return my >= WIN_SCORE && my - foe >= WIN_MARGIN;
+  return evaluateWin(my, foe, WIN_SCORE, WIN_MARGIN);
 }
 
 function recordMissApproach(room, ball, edge, faceX) {
@@ -1635,220 +967,78 @@ function recordMissApproach(room, ball, edge, faceX) {
  * @param {object} ball 出界球
  * @returns {void}
  */
+/**
+ * 记录一次失分的取证信息。实现位于 server/match.js。
+ */
 function recordMiss(room, concededBy, ball) {
-  const id = room.missLog.length + 1;
-  room.missLog.push({
-    id,
-    matchId: room.matchId,
-    serverTime: room.serverTime,
-    tick: room.tick,
-    substep: room.substep,
-    scorer: 1 - concededBy,
-    concededBy,
-    ball: {
-      id: ball ? ball.id : null,
-      x: ball ? r1(ball.x) : null,
-      y: ball ? r1(ball.y) : null,
-      vx: ball ? r1(ball.vx) : null,
-      vy: ball ? r1(ball.vy) : null,
-    },
-    approach: ball ? (room.lastMissApproach[ball.id] || null) : null,
-  });
-  if (ball) delete room.lastMissApproach[ball.id];
+  match.recordMiss(room, concededBy, ball);
 }
 
+/**
+ * 结算一个进球：计分、判胜负、必要时重新发球。
+ * 实现位于 server/match.js。
+ */
 function afterGoal(room, concededBy, ball) {
-  recordMiss(room, concededBy, ball);
-  // ★ 先把这个漏掉的球从场上拿走。剩下的球继续在场上飞 ——
-  //   "一回合要所有球都没接住才重发"就体现在这里。
-  if (ball) {
-    const i = room.balls.indexOf(ball);
-    if (i >= 0) room.balls.splice(i, 1);
-  }
-
-  // ★ 原实现写的是 room.score[concededBy]（**失分方**的分数），判定对象就错了。
-  //   症状：先到 WIN_SCORE 的一方不会赢，反而在自己丢下一个球时把胜利判给对手；
-  //   而且只要失分方分数够，比赛就莫名结束。胜负只能看得分方的分数。
-  const scorer = 1 - concededBy;
-
-  // ★ 计分只能在这里做。若留在 stepBall 里直接 +1，双倍得分就只是"显示的分数变了"，
-  //   胜负判定读到的还是没乘倍率的值 —— 会出现"加分了却不算赢"的怪事。
-  const now = Date.now();
-  const gain = room.doubleUntil[scorer] > now ? 2 : 1;
-  room.score[scorer] += gain;
-
-  const my = room.score[scorer];
-  const foe = room.score[concededBy];
-
-  room.events.push(`g${scorer}`);   // 得分音效
-  if (gain === 2) room.events.push(`x${scorer}`);   // 这一分是双倍，得说清楚
-
-  if (isWin(my, foe)) {
-    room.phase = 'over';
-    room.winner = scorer;
-    room.phaseEndsAt = Date.now() + OVER_HOLD_MS;
-    // ★ 这一局结束了 ⇒ 下一局开始时要给玩家一次重选拍子的机会。
-    //   标记在这里立、由 startMatch 翻开（phase 变 countdown）、发球时关掉。
-    room.reselectPending = true;
-    // 场上还剩的球全部冻住（不是只冻第一个，否则多球时还有球在飞）
-    for (const b of room.balls) { b.vx = 0; b.vy = 0; }
-    room.events.push(`o${scorer}`);   // 一局结束
-    return;
-  }
-
-  // ★ 只有场上一个**真球**都不剩了才重新发球。
-  //   还有球在飞就继续打 —— 这就是"所有球都没接住才重发"。
-  // ★ 判据必须是"真球"而不是 balls.length：幻影球是假的，让它把回合吊住的话，
-  //   这一回合会变成"真球已经出界算过分、却还在等一个不算分的假球飞完"的怪状态。
-  //   顺带一提，resetBall 会把整个数组换掉，所以重发时幻影球自然一起消失。
-  if (!room.balls.some((b) => !isPhantom(b))) resetBall(room, concededBy);   // 谁丢分，球发给谁
+  match.afterGoal(room, concededBy, ball);
 }
 
 /**
  * 挑出"最快就要打到某条边"的那个球。多球时 AI 只可能处理最紧急的一个 ——
  * 同时照顾两个球是做不到的，硬要平均分配反而两个都接不到。
- * goingRight = 这条边在右边（球从左边飞过来）。
+ * 服务端兼容入口保留原函数签名，AI 实现位于 server/bot.js。
  */
 function mostUrgentBall(room, goingRight, list) {
-  const faceX = goingRight
-    ? room.W - PADDLE_MARGIN - PADDLE_W - BALL_R
-    : PADDLE_MARGIN + PADDLE_W + BALL_R;
-  let best = null;
-  let bestT = Infinity;
-  // ★ 默认看 `room.balls`（真值），但允许传一份"它自己以为的球"。
-  //   被隐形球骗到的 AI 走的就是后者（见 botPerceive）：
-  //   它不再拿真值算落点，只能拿上次看见时的那份状态硬推。
-  for (const b of (list || room.balls)) {
-    const vx = b.vx * (room.ballMul || 1);
-    if (goingRight ? vx <= 1 : vx >= -1) continue;   // 没朝这边飞
-    const t = (faceX - b.x) / vx;
-    if (t >= 0 && t < bestT) { bestT = t; best = b; }
-  }
-  return best;
+  return botBehavior.mostUrgentBall(room, goingRight, list);
 }
 
 /**
  * 预测球到达某条竖线时的 y 坐标，含上下墙反射。
- * 用三角波把无限延伸的直线折叠回场内 —— 比"一段一段循环模拟"更短，也不累积误差。
+ * 服务端兼容入口保留原函数签名，纯计算实现位于 server/rules.js。
  */
 function predictY(room, b, faceX) {
-  const m = room.ballMul || 1;
-  const vx = b.vx * m;
-  const vy = b.vy * m;
-  if (Math.abs(vx) < 1) return b.y;
-  const t = (faceX - b.x) / vx;
-  if (!(t > 0)) return b.y;
-
-  const span = room.H - 2 * BALL_R;
-  let k = (b.y + vy * t - BALL_R) / span;
-  // ★ 折到 [0, 2)：一个周期是 **2 个 span**（一个 span 走到底，再一个 span 走回来）。
-  //   写成 "取小数部分再对半折" 是周期 1 的三角波，球一旦碰到墙就会算到错的落点。
-  k -= Math.floor(k / 2) * 2;
-  const tri = k <= 1 ? k : 2 - k;
-  return BALL_R + tri * span;
+  return calculatePredictY(room, b, faceX, BALL_R);
 }
 
 /**
- * 机器人【感知】。按反应间隔更新瞄准误差与目标落点 —— 这里才是"反应时间"。
- * ★ 它和下面的【操控】必须分开。原因见 botSteer 的注释。
- * 参数是**槽位**：coop 里 AI 占的是第 3 个槽位。
+ * Extracted AI behavior is assembled here with explicit dependencies. The AI
+ * module never imports this entry point; all live calls go through the wrapper
+ * functions below so the public API and call sites stay unchanged.
+ */
+const botBehavior = createBotBehavior({
+  BOT_PRESETS,
+  BALL_R,
+  PADDLE_MARGIN,
+  PADDLE_W,
+  PADDLE_SPEED,
+  PHANTOM_BOT_SWAY,
+  SUB_DT,
+  clamp,
+  isPhantom,
+  paddleHalf,
+  predictY,
+});
+
+/**
+ * Update an AI player's remembered vision and target.
+ *
+ * @param {object} room Current room state.
+ * @param {number} slot AI paddle slot index.
+ * @param {number} now Current server timestamp.
+ * @returns {void}
  */
 function botPerceive(room, slot, now) {
-  const p = room.players[slot];
-  const cfg = p.cfg;
-  const team = room.slots[slot].team;
-  const mine = room.slots[slot].edge === 'right';
-
-  // ★ 隐形球会把 AI 一起骗到 —— 不这么做的话，这道道具只在"两个真人"时成立，
-  //   人机局里吃到它等于什么都没发生（AI 照样看得见真值，照样接得住）。
-  //   做法和真人完全一样：**只按上次看见时的位置和速度去推**。
-  //   p.seen 是"它脑子里的球"，不隐形时每 tick 刷新；隐形期间冻结在最后一次看见的状态。
-  const blind = room.invisUntil[team] > now;
-  // ★★ 幻影球必须排除在 AI 的"世界观"之外 —— 这是"幻影球对电脑无效"的根因。
-  //   幻影球是**释放方看不见、对方看得见**的假球，它的全部作用是骗对手去接错地方；
-  //   而它按设计不与拍子碰撞、出界也不计分。
-  //   如果 AI 也把它算进 `mostUrgentBall`，就会发生两件都不对的事：
-  //     ① AI 被引到假球上站定 —— 看起来"被骗到了"，但骗法完全不对：真球来了它
-  //        人不在位置，这不是"人类被迷惑"，是"AI 在追一个空气球"；
-  //     ② 更糟的是假球通常比真球先"打到"它（幻影球和真球是同一个位置分出来的），
-  //        于是 AI 会**优先**去接假球，真球直接漏掉 —— 表现为 AI 突然像傻了一样。
-  //   正确的建模是：**幻影球对 AI 生效的方式 = 让 AI 看见两个球、从而选错**，
-  //   而不是"让 AI 去接一个不存在的碰撞体"。所以这里把幻影球**当作真球一样
-  //   参与选择**（它看起来就是球），但选中之后的落点预判走它自己的轨迹 ——
-  //   AI 于是真的会被带偏，且偏得和真人一样自然。
-  const vision = room.balls.filter((b) => !isPhantom(b) || b.phantom !== team);
-  if (!blind) {
-    p.seen = [];
-    for (const b of vision) {
-      p.seen.push({ id: b.id, x: b.x, y: b.y, vx: b.vx, vy: b.vy, phantom: b.phantom });
-    }
-  }
-  // 隐形期间新分裂出来的球它根本不知道存在（p.seen 里没有这个 id），
-  // 于是只会在"它记得的那几个球"里挑一个去接 —— 这正是看不见的表现。
-  const seen = blind ? (p.seen || []) : vision;
-  const b = mostUrgentBall(room, mine, seen);
-  if (!b) { p.chasing = false; p.chaseId = 0; return; }
-  const chasing = mine ? b.vx > 0 : b.vx < 0;
-
-  // 球刚开始朝自己飞 —— 这一球重新掷一次瞄准误差，然后**保持到这一球结束**。
-  // ★ 若每次思考都重掷，拍子会在目标附近来回抖，反而更容易把球蹭到，难度就白设了。
-  // ★ 多球时用**球的 id** 判断"换球了没"：只看 chasing 这个布尔量的话，
-  //   从 A 球切到 B 球（chasing 一直是 true）会沿用上一个球的瞄准误差。
-  // ★ 幻影球带一个**额外的瞄准误差**：它是一颗"故意做成看起来完全一样的球"，
-  //   但 AI 追它本来就没有意义（接到也不会弹、也不得分）。给它一点额外偏差，
-  //   于是"被幻影球骗到"这件事在表现上是**概率性的**——AI 有时被带偏、
-  //   有时识破继续守真球，和人面对假球的反应一致；而不是"必定被带走"或"完全无视"。
-  const phantomErr = b.phantom === undefined ? 0 : PHANTOM_BOT_SWAY;
-  if (chasing && p.chaseId !== b.id) {
-    p.aimErr = (Math.random() * 2 - 1) * cfg.errPx
-      + (Math.random() * 2 - 1) * phantomErr;
-  }
-  p.chaseId = chasing ? b.id : 0;
-  p.chasing = chasing;
-
-  if (now < p.thinkAt) return;               // 限频：这就是"反应时间"
-  p.thinkAt = now + cfg.thinkMs;
-
-  const faceX = mine
-    ? room.W - PADDLE_MARGIN - PADDLE_W - BALL_R
-    : PADDLE_MARGIN + PADDLE_W + BALL_R;
-
-  if (chasing) {
-    // ★ 追的是幻影球时，AI 预判的是**幻影球的落点**——它真的会跑过去站好。
-    //   这正是幻影球该有的效果：AI 被骗到错的位置，而真球从旁边过去。
-    p.targetY = predictY(room, b, faceX) + p.aimErr;
-  } else {
-    // 球在往对面飞：回自己那半场的中路待命，带点随机偏移，看起来不像机器
-    const [yMin, yMax] = room.slots[slot].span;
-    p.targetY = (yMin + yMax) / 2 + (Math.random() * 2 - 1) * (yMax - yMin) * 0.09;
-  }
+  botBehavior.botPerceive(room, slot, now);
 }
 
 /**
- * 机器人【操控】。每个 tick 都朝着目标微调方向。
+ * Steer an AI paddle toward its current target.
  *
- * ★ 为什么不能只在"思考"的那一下决定方向：
- *   困难档一个决策间隔里拍子会走 110ms × 540px/s ≈ 59px，而判定阈值只有
- *   拍子半长 48 + 球半径 9 = 57px。只在思考时决定方向，拍子就会以满速在目标
- *   两侧来回摆（实测 268→214→268→286），几乎永远不在正确位置上 —— 表现为
- *   "AI 一直在动、离球也不远，却一个球都接不住"。
- *   感知可以慢（反应时间），操控必须连续。这也是真人打球的样子。
+ * @param {object} room Current room state.
+ * @param {number} slot AI paddle slot index.
+ * @returns {void}
  */
 function botSteer(room, slot) {
-  const p = room.players[slot];
-  const half = paddleHalf(room, slot);
-  const [yMin, yMax] = room.slots[slot].span;
-  const mid = (yMin + yMax) / 2;
-  const lo = yMin + half;
-  const hi = yMax - half;
-  // 拍子比活动区间还长时（理论上不该发生）就钉在中点，别让 clamp 反过来
-  const target = hi < lo ? mid : clamp(p.targetY === undefined ? mid : p.targetY, lo, hi);
-  const d = target - room.paddles[slot];
-  // 死区要小：它会直接变成"停在离目标差一点"的系统性偏差。
-  // 实测 9px 会让总偏差从 57 顶到 59.6，恰好越过判定阈值。
-  // 操控是按子步长（540/240 = 2.25px）推进的，所以 4px 足够防止抖动。
-  const dead = Math.max(3, PADDLE_SPEED * (p.speedMul || 1) * SUB_DT * 1.5);
-  p.dir = Math.abs(d) < dead ? 0 : (d > 0 ? 1 : -1);
+  botBehavior.botSteer(room, slot);
 }
 
 function stepPaddles(room, dt) {
@@ -1881,87 +1071,12 @@ function stepPaddles(room, dt) {
   }
 }
 
+/**
+ * 推进一个房间一个 tick：冻结处理、开局、阶段状态机与模拟子步。
+ * 实现位于 server/match.js。
+ */
 function stepRoom(room, now) {
-  room.serverTime = now;
-
-  // 机器人永远"在场"，所以人机模式不会因为缺人而暂停
-  const bothPresent = room.players.every(isPresent);
-  room.paused = !bothPresent;
-
-  // 玩家主动暂停（任意一方按下即生效，见 togglePause）。
-  // ★ `room.started` 这个前提不能省：先建房的那个人闲得按一下暂停，第二个人进来
-  //   就会卡在"已暂停"、第一局永远开不了 —— 而那时候两边都还没打过球，
-  //   "恢复"按钮在没开过局的房间里也不该有意义。
-  const userFrozen = room.started && room.userPaused;
-  const frozen = room.paused || userFrozen;
-
-  // 缺人：冻结比赛。比分、球的位置都原样保留，人回来接着打。
-  // 倒计时的截止时刻往后推，避免他重连回来时倒计时已经悄悄走完。
-  if (frozen) {
-    // ★ 冻结期间**每个 tick** 都把挂钟型截止时刻按"上一 tick 到现在过了多久"同步后移，
-    //   等价于"比赛时间彻底静止"。为什么要持续做而不是解冻时补一次：
-    //   服务端每个快照都会用这些时间戳**算**出下发的字段（冰冻还剩几秒 fz、
-    //   球的不透明度 ia、双倍得分是否生效 db）。只在解冻那一刻补的话，暂停期间
-    //   这些字段会一路走到"已过期" —— 玩家看到的是"暂停中对手忽然又能看见球了"
-    //   "双倍得分显示成没了，一恢复又冒出来"。持续后移则全程都是暂停前那一刻的值。
-    //   （这条是实测踩出来的：第一版就是"解冻时补一次"，test-rules 第 18 节直接报红。）
-    // ★ 它同时也是自纠正的：把一个截止时刻后移"已经过去的那段时间"，定义上就等于
-    //   "这段时间没走过"。所以哪怕别处再多移一次，也不会把它推到未来去。
-    if (room.frozenAt) shiftDeadlines(room, now - room.frozenAt);
-    room.frozenAt = now;
-    if (room.phase === 'countdown') room.phaseEndsAt = now + COUNTDOWN_MS;
-    room.tick += 1;
-    return;
-  }
-
-  // 刚从冻结里出来。
-  if (room.frozenAt) {
-    // 补上"最后一次冻结 tick → 解冻 tick"之间那一小段，然后收工
-    shiftDeadlines(room, now - room.frozenAt);
-    room.frozenAt = 0;
-    // ★ 倒计时重新数一整段。冻结期间它每 tick 都被重设成"当前 + 1.8s"，本来就已经
-    //   是"完整一段"了，这里再设一次是为了让"谁负责它"只有一个答案：countdown 的
-    //   截止时刻**只由这两处重设**，shiftDeadlines 里那句 `phase === 'over'` 的
-    //   分支永远轮不到 countdown。恢复后给一整段倒计时，玩家有时间把手放回拍子上。
-    if (room.phase === 'countdown') room.phaseEndsAt = now + COUNTDOWN_MS;
-  }
-
-  // 人齐了但还没开过第一局 —— 只有这时候才允许重置比分
-  if (!room.started) {
-    startMatch(room);
-    room.started = true;
-  }
-
-  trackMods(room, now);   // 道具效果到期复位（漏了这句道具就会永久生效）
-
-  if (room.phase === 'over') {
-    if (now >= room.phaseEndsAt) startMatch(room);   // 一局打完自动开下一局
-    room.tick += 1;
-    return;
-  }
-
-  if (room.phase === 'countdown') {
-    for (let i = 0; i < SUBSTEPS; i += 1) stepPaddles(room, SUB_DT);
-    if (now >= room.phaseEndsAt) launchBall(room);
-    room.tick += 1;
-    return;
-  }
-
-  // playing：先按细分的固定步长推进，再判定
-  for (let i = 0; i < SUBSTEPS; i += 1) {
-    room.substep = i;
-    stepPaddles(room, SUB_DT);
-    if (room.phase !== 'playing') break;   // 中间可能因得分切换了阶段
-    stepBalls(room, SUB_DT);
-  }
-  stepPowerup(room, now);   // 生成 / 过期 / 被球碰到
-  if (DEBUG_FX) debugShowcaseFx(room, now);
-  // 取证用：把弧线一直续上，让探针有时间截图
-  if (DEBUG_CURVE && room.curveUntil < now) {
-    room.curveUntil = now + 60000;
-    room.curveSpin = CURVE_SPIN;
-  }
-  room.tick += 1;
+  match.stepRoom(room, now);
 }
 
 // 只给探针取证用。效果的画面归谁：
@@ -2151,28 +1266,22 @@ function broadcastState(room) {
 }
 
 // ---------- 入座 / 离座 ----------
+// 座位与 token 的规则在 server/match.js；ws 只作为玩家记录上的引用传进去，
+// 模块自己不 send、不认识 WebSocket。
+/**
+ * 把一个真人连接放到某个槽位上（皮肤在入座那一刻定下）。
+ * 实现位于 server/match.js。
+ */
 function seatPlayer(room, ws, side, token, skin) {
-  room.players[side] = { ws, token, dir: 0, since: Date.now() };
-  // 皮肤只在**入座那一刻**确定。掉线重连走的是 handleRejoin（不经过这里），
-  // 所以重连回来还是原来那块拍子 —— 换了皮肤会让对手的认知错位。
-  room.skins[side] = normSkin(skin);
-  ws.player = { code: room.code, side, token };
-  room.lastActivity = Date.now();
+  match.seatPlayer(room, ws, side, token, skin);
 }
 
+/**
+ * 挑一个可以坐下来的槽位：优先空位，其次顶替掉线超时的真人位（绝不顶 AI）。
+ * 实现位于 server/match.js。
+ */
 function findSeat(room) {
-  // 优先真正的空位；若都被占但有人掉线，则顶替掉线的那个座位，保证随时能开始玩
-  for (let i = 0; i < room.N; i += 1) if (!room.players[i]) return i;
-  const now = Date.now();
-  for (let i = 0; i < room.N; i += 1) {
-    const p = room.players[i];
-    // ★ 机器人的座位绝不能被真人顶替。它没有 ws，会被下面那句判成"掉线"，
-    //   于是 90 秒后随便谁一加入就坐到了 AI 身上，人机对战忽然变成一个人空转。
-    if (isBot(p)) continue;
-    const dead = !p.ws || p.ws.readyState > 1;
-    if (dead && now - p.since > SLOT_GRACE_MS) return i;
-  }
-  return -1;
+  return match.findSeat(room);
 }
 
 /** 发给客户端的入座回执。三种模式共用，客户端靠 mode 决定自己的布局与文案 */
@@ -2193,6 +1302,10 @@ function joinedPayload(room, code, side, token, host) {
   };
 }
 
+/**
+ * 建房。房间生命周期在 server/match.js，这里只负责取房间号、
+ * 登记房间、座位，然后把 joined 回执交给连接管理发出去。
+ */
 function handleCreate(ws, mode, level, skin) {
   if (ws.player) return send(ws, { t: 'error', msg: '你已经在房间里了' });
   const md = normMode(mode);
@@ -2223,18 +1336,11 @@ function handleJoin(ws, code, skin) {
 function handleRejoin(ws, code, token) {
   const room = rooms.get(code);
   if (!room) return send(ws, { t: 'error', msg: '房间已不存在' });
-  for (let i = 0; i < room.N; i += 1) {
-    const p = room.players[i];
-    if (p && !isBot(p) && p.token === token) {
-      p.ws = ws;
-      p.dir = 0;
-      p.since = Date.now();
-      ws.player = { code, side: i, token };
-      room.lastActivity = Date.now();
-      send(ws, { ...joinedPayload(room, code, i, token, false), t: 'rejoined' });
-      console.log(`[room] ${code} rejoined slot ${i}`);
-      return;
-    }
+  const side = match.rejoinPlayer(room, ws, token);
+  if (side >= 0) {
+    send(ws, { ...joinedPayload(room, code, side, token, false), t: 'rejoined' });
+    console.log(`[room] ${code} rejoined slot ${side}`);
+    return;
   }
   send(ws, { t: 'error', msg: '座位已失效，请重新加入' });
 }
@@ -2310,12 +1416,7 @@ function handleClose(ws) {
   if (!ws.player) return;
   const room = rooms.get(ws.player.code);
   if (!room) return;
-  const p = room.players[ws.player.side];
-  if (p && p.token === ws.player.token) {
-    p.dir = 0;
-    // 保留座位与 token，等待重连；ws 仍指向已关闭的连接，anyAlive 会正确判定
-    room.lastActivity = Date.now();
-  }
+  match.releasePlayer(room, ws, ws.player.side, ws.player.token);
 }
 
 // ---------- HTTP：静态文件 + 健康检查 ----------
@@ -2460,58 +1561,58 @@ wss.on('connection', (ws) => {
   ws.on('error', () => {});
 });
 
-// 保活：既是探针要观察的点，也防止中间设备把空闲连接回收掉
-setInterval(() => {
-  wss.clients.forEach((ws) => {
-    if (ws.isAlive === false) return ws.terminate();
-    ws.isAlive = false;
-    ws.ping();
-  });
-}, 25000);
+// 离线测试只加载纯逻辑：既不监听端口，也不启动任何常驻定时器。
+if (process.env.PONG_NO_LISTEN !== '1') {
+  // 保活：既是探针要观察的点，也防止中间设备把空闲连接回收掉
+  setInterval(() => {
+    wss.clients.forEach((ws) => {
+      if (ws.isAlive === false) return ws.terminate();
+      ws.isAlive = false;
+      ws.ping();
+    });
+  }, 25000);
 
-// ---------- 主循环 ----------
-// 为什么不用 setInterval(fn, 1000/30)：Windows 的定时器粒度约 15.6ms，
-// 33.33ms 会被系统向上取整成 46.8ms，实测只有 21.5Hz —— 平台不同球速就不一样。
-// 改成「高频轮询 + 固定步长累加器」：轮询只管看看欠了多少时间，模拟始终按
-// 33.33ms 的固定步长推进，长期平均频率因此与操作系统无关。
-const STEP_MS = 1000 / TICK_HZ;
-let timeDebt = 0;
-let lastPump = Date.now();
+  // ---------- 主循环 ----------
+  // 为什么不用 setInterval(fn, 1000/30)：Windows 的定时器粒度约 15.6ms，
+  // 33.33ms 会被系统向上取整成 46.8ms，实测只有 21.5Hz —— 平台不同球速就不一样。
+  // 改成「高频轮询 + 固定步长累加器」：轮询只管看看欠了多少时间，模拟始终按
+  // 33.33ms 的固定步长推进，长期平均频率因此与操作系统无关。
+  const STEP_MS = 1000 / TICK_HZ;
+  let timeDebt = 0;
+  let lastPump = Date.now();
 
-setInterval(() => {
-  const now = Date.now();
-  timeDebt += now - lastPump;
-  lastPump = now;
+  setInterval(() => {
+    const now = Date.now();
+    timeDebt += now - lastPump;
+    lastPump = now;
 
-  // 进程被卡住（GC、宿主机抢占）后不要一次性追补几十个 tick，否则会瞬移
-  if (timeDebt > 250) timeDebt = 250;
+    // 进程被卡住（GC、宿主机抢占）后不要一次性追补几十个 tick，否则会瞬移
+    if (timeDebt > 250) timeDebt = 250;
 
-  let stepped = false;
-  while (timeDebt >= STEP_MS) {
-    for (const room of rooms.values()) stepRoom(room, now);
-    timeDebt -= STEP_MS;
-    stepped = true;
-  }
-
-  // 一个轮次里补了多个 tick 也只广播一次，避免客户端收到间隔忽大忽小的快照
-  if (stepped) {
-    for (const room of rooms.values()) broadcastState(room);
-  }
-}, 8);
-
-// 回收空房间
-setInterval(() => {
-  const now = Date.now();
-  for (const [code, room] of rooms) {
-    if (!anyAlive(room) && now - room.lastActivity > ROOM_IDLE_MS) {
-      rooms.delete(code);
-      console.log(`[room] ${code} reclaimed`);
+    let stepped = false;
+    while (timeDebt >= STEP_MS) {
+      for (const room of rooms.values()) stepRoom(room, now);
+      timeDebt -= STEP_MS;
+      stepped = true;
     }
-  }
+
+    // 一个轮次里补了多个 tick 也只广播一次，避免客户端收到间隔忽大忽小的快照
+    if (stepped) {
+      for (const room of rooms.values()) broadcastState(room);
+    }
+  }, 8);
+
+  // 回收空房间
+  setInterval(() => {
+    const now = Date.now();
+    for (const [code, room] of rooms) {
+      if (!anyAlive(room) && now - room.lastActivity > ROOM_IDLE_MS) {
+        rooms.delete(code);
+        console.log(`[room] ${code} reclaimed`);
+      }
+    }
 }, 30000);
 
-// 测试时只想拿这里的纯逻辑，不想再起一个监听去和已跑的服务抢端口
-if (process.env.PONG_NO_LISTEN !== '1') {
   server.listen(PORT, HOST, () => {
     console.log(`pong-online listening on http://${HOST}:${PORT}`);
   });

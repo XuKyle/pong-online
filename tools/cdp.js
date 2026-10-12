@@ -11,87 +11,11 @@
  *   不受 --user-data-dir 控制，跑一次能往 C 盘塞上百 MB。
  */
 
-const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const { EDGE_CANDIDATES, startEdge, waitEdgeReady, killEdge } = require('./cdp-browser');
 
-// 无头浏览器可执行文件。★ **顺序有意义**：Edge 排最前 —— 本机一直用 Edge，
-//   换顺序等于让所有渲染类断言改成对着另一个浏览器跑。Chrome / Chromium 只是**兜底**，
-//   让拿到这份代码的人在没装 Edge 的机器（或 macOS / Linux）上也能跑起来。
-//   要强制指定就设 PROBE_BROWSER=<可执行文件的绝对路径>。
-const EDGE_CANDIDATES = [
-  process.env.PROBE_BROWSER,
-  'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
-  'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
-  'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
-  'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
-  '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-  '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
-  '/usr/bin/google-chrome',
-  '/usr/bin/chromium',
-  '/usr/bin/chromium-browser',
-].filter(Boolean);   // ★ filter 不能省：PROBE_BROWSER 没设时它是 undefined，
-                     //   fs.existsSync(undefined) 会直接抛 TypeError。
-
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-/** 起一个无头 Edge，返回 { child, profile } */
-function startEdge(opts) {
-  const dbgPort = opts.dbgPort;
-  const tmpDir = opts.tmpDir;
-  const profile = path.join(tmpDir, (opts.profileName || 'edgeprobe') + '_' + Date.now());
-
-  const edge = EDGE_CANDIDATES.find((p) => fs.existsSync(p));
-  if (!edge) throw new Error('找不到 Edge 可执行文件');
-
-  fs.mkdirSync(profile, { recursive: true });
-  const child = spawn(edge, [
-    '--headless=new',
-    `--remote-debugging-port=${dbgPort}`,
-    `--user-data-dir=${profile}`,
-    '--enable-unsafe-swiftshader',
-    // ★ 防后台节流三件套。`--headless=new` 下后台标签的 visibilityState 是 'hidden'，
-    //   rAF 会被暂停/降到 1Hz —— 于是"画布上画了没画"这类断言会在**同一个页面、
-    //   同一份代码**上时而通过时而失败（实测遇到过，`Page.bringToFront` 有时赶不及）。
-    //   这几个开关让每个标签页都持续渲染，断言才与"谁在前台"无关。
-    '--disable-background-timer-throttling',
-    '--disable-backgrounding-occluded-windows',
-    '--disable-renderer-backgrounding',
-    '--disable-features=OverscrollHistoryNavigation',
-    '--no-first-run',
-    '--no-default-browser-check',
-    '--disable-extensions',
-    '--mute-audio',
-    'about:blank',
-  ], {
-    env: { ...process.env, TEMP: tmpDir, TMP: tmpDir },
-    stdio: 'ignore',
-    detached: false,
-  });
-
-  return { edge, child, profile };
-}
-
-async function waitEdgeReady(dbgPort, tries = 100) {
-  for (let i = 0; i < tries; i += 1) {
-    try {
-      const r = await fetch(`http://127.0.0.1:${dbgPort}/json/version`);
-      if (r.ok) return true;
-    } catch (e) { /* not yet */ }
-    await sleep(200);
-  }
-  return false;
-}
-
-function killEdge(child) {
-  try {
-    if (process.platform === 'win32') {
-      spawn('taskkill', ['/F', '/T', '/PID', String(child.pid)], { stdio: 'ignore' });
-    } else {
-      child.kill('SIGKILL');
-    }
-  } catch (e) { /* ignore */ }
-}
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // ---------- CDP 会话 ----------
 function connectTarget(wsUrl) {

@@ -6,7 +6,7 @@
 - 在线体验：<https://pong-online-battle.app.workbuddy.host/>
 - 玩法：1v1 对战 / 人机 / 双人打 AI；九种道具；**双方随时可暂停**；
   **每局自选拍子皮肤（颜色 = 技能）**：灰=没有技能、青=风、黄=幻影、红=超高速。
-- 电脑端和手机端是**同一个 HTML 文件**，靠两段 media query 切换 —— 没有第二个页面、没有 `/m`。
+- 电脑端和手机端是**同一套文件**，靠 media query 切换 —— 没有第二个页面、没有 `/m`。
 
 ---
 
@@ -30,23 +30,33 @@ PORT=3100 npm start
 
 ## 想改什么，去哪儿改
 
+服务端拆成了 `server/` 下的若干模块，`server.js` 保留为**兼容入口**：
+它装配依赖、提供原有函数名（测试与探针仍按老名字 require 它），并负责 HTTP / WebSocket 传输。
+
 | 想改的东西 | 位置 |
 |---|---|
-| 球速 / 拍子尺寸 / 手感 | `server.js` **L24** 起的场地与物理参数区（`BALL_SPEED_START`、`SPEEDUP_PER_HIT`、`PADDLE_SPEED`…） |
-| 九种道具的效果 / 半径 / 刷新频率 | `server.js` **L91** 起的道具区 |
-| 拍子皮肤与三种技能 | `server.js` **L159**（常量）＋ **L532** 起的技能区 |
-| AI 强度 | `server.js` **L214** 起的人机难度区 |
-| 建房/加入/掉线重连 | `server.js` **L1619** 起的入座区、**L1846** 起的 WebSocket 区 |
-| 计分与胜负 | `server.js` 的 `afterGoal()`（★ 计分**只能**在这里做，原因见下） |
-| 界面配色 / 布局 | `public/index.html` 的 CSS（L1 起） |
-| **手机端布局** | `public/index.html` 的两段 media query：**L230**（窄屏/竖屏）、**L285**（横屏铺满） |
-| 画面渲染 | `public/index.html` **L2050** 起的渲染区 |
-| 输入（键盘 / 鼠标 / 触摸） | `public/index.html` **L1267**（输入）、**L1344**（触屏） |
-| 背景音乐 / 音效 | `public/index.html` **L717**（声音）、L865（背景音乐） |
-| 探针用的读取钩子 | `public/index.html` **L1907** 的 `__probe()` |
+| 球速 / 拍子尺寸 / 手感 | `server.js` **L75** 起的常量区（`BALL_SPEED_START`、`SPEEDUP_PER_HIT`、`PADDLE_SPEED`…） |
+| 九种道具的效果 / 半径 / 刷新频率 | `server.js` **L112** 起的道具常量区 ＋ `server/powerups.js` |
+| 拍子皮肤与技能 | `server.js` **L159**（常量）＋ `server/skills.js` |
+| AI 强度 | `server.js` **L323** 起的人机难度区 ＋ `server/bot.js` |
+| 球的运动 / 碰撞 / 反弹 / 防卡死 | `server/physics.js` |
+| 建房/加入/掉线重连/开局/计分/阶段流转 | `server/match.js` |
+| 效果到期与**暂停冻结**的时钟语义 | `server/effects.js`（全局唯一一份） |
+| 胜负判定 / 落点预测（纯函数） | `server/rules.js` |
+| HTTP 路由 / WebSocket 连接与消息分发 | `server.js`（传输层，领域模块里没有 socket） |
+| 界面配色 / 布局 | `public/index.css`（整份就是原来内联的 `<style>` 块） |
+| **手机端布局** | `public/index.css` 的 media query：**L328**（≤760px 窄屏）、**L362**（竖屏）、**L386**（横屏矮窗铺满） |
+| 画面渲染 | `public/index.html` **L1986** 起的渲染区 |
+| 输入（键盘 / 鼠标 / 触摸） | `public/index.html` **L1203**（输入）、**L1280**（触屏） |
+| 背景音乐 / 音效 | `public/index.html` **L653**（声音）、L801（背景音乐） |
+| 探针用的读取钩子 | `public/index.html` **L2040** 的 `__probe()` |
 
-`public/index.html` 是**单文件**：CSS、DOM、JS 全在里面（约 2600 行），没有构建步骤，
-改完刷新即生效。`server.js` 约 2000 行，但每个分区开头都有长注释解释"为什么这么写"。
+依赖方向是单向的：`server/rules.js` 在最底，往上是 `physics` / `bot` / `powerups` / `skills`，
+效果时钟 `effects` 独占暂停冻结语义，`match` 站在这些之上，
+`server.js`（传输）只在最外层装配 —— 没有任何领域模块反向 require 入口文件或互相 require。
+
+页面由 `public/index.html`（DOM 骨架 + `<script>`）+ `public/index.css`（样式表）组成，
+没有构建步骤，改完刷新即生效。
 
 ---
 
@@ -62,6 +72,9 @@ PORT=3100 npm start
 | `tools/check-solo.js` | 人机（AI 真的会接球 + 难度可测） | 29/0 |
 | `tools/check-coop.js` | 双人打 AI 的半场划分与边界 | 31/0 |
 | `tools/check-collision.js` | 拍子可接区间的暴力扫描 | 16/0 |
+| `test-physics-sequence.js` | 球物理的更新顺序（位移 → 撞球 → 墙反弹） | 3/0 |
+| `test-lifecycle.js` | 建房/加入/暂停/掉线重连/一局打完/自动开下一局 | 24/0 |
+| `test-cdp-compat.js` | `tools/cdp.js` 旧导出与浏览器生命周期模块的兼容 | 通过 |
 | `tools/probe.js` | 真实浏览器双标签页联机 | 58/0 |
 | `tools/probe-solo.js` | 真实浏览器人机 | 43/0 |
 | `tools/probe-coop.js` | 真实浏览器双人打 AI | 49/0 |
