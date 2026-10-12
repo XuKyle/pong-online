@@ -99,148 +99,68 @@
 
 </div>
 
+<!-- 应用各模块。classic script（不是 type="module"），所以顺序就是执行顺序：
+     context 在最底，其余模块（audio/input/ui/network/render/diagnostics/probe）
+     都只依赖它，彼此之间通过 app.<area> 互相调用，不共享闭包变量。 -->
+<script src="/js/context.js"></script>
+<script src="/js/audio.js"></script>
+<script src="/js/input.js"></script>
 <script>
 (function () {
   'use strict';
 
-  // ---------- 与服务端共用的常量（必须保持一致） ----------
-  // ★ W / H 是**可变的**：各模式的场地不一样（coop 的球台更高），
-  //   服务端每帧把真实尺寸放在快照的 wh 里下发，收到就更新这两个变量。
-  //   渲染代码全部读它们，所以换场地不需要改任何绘制逻辑。
-  var W = 800, H = 500;
-  var PADDLE_W = 14, PADDLE_H = 96, PADDLE_MARGIN = 26, BALL_R = 9;
-  var PADDLE_SPEED = 540;
-  var WIN_SCORE = 11, WIN_MARGIN = 2;
-  var POWERUP_R = 21;   // 必须和服务端一致，否则画出的大小和实际碰撞范围对不上
-  var POWERUP_MAX = 3;  // 场上最多同时几个。只用于诊断上报，绘制是按服务端下发的数组逐个画
-  var TICK_HZ = 30;
-  // ★ 必须与服务端一致。只用来把"风还剩几秒"归一成 0~1 好算渐入渐出 ——
-  //   风的真正时长、施力大小全在服务端，客户端一秒钟都不参与物理。
-  //   （这条是探针在真实浏览器里抓出来的：漏了它 drawWind 会直接抛异常，
-  //     而异常发生在 loop 里 draw() 之后、requestAnimationFrame 之前 ⇒ **整个渲染循环当场停摆**，
-  //     画面冻住但按钮还在更新，看着像"卡了"。）
-  var WIND_MS = 1000;
-  // ★ 黑洞的两个数也必须在客户端有一份（与服务端一致）：
-  //   HOLE_R 决定"画出来的洞"和"真的能吸到球的半径"看起来是不是同一个东西
-  //   —— 画小了会让人觉得球擦着洞边飞过却没进去，画大了会让人觉得明明进了却没吸走。
-  //   HOLE_LIFE_MS 用来把"还剩几秒"归一成 0~1，好让洞到寿前收缩一下。
-  var HOLE_R = 34;
-  var HOLE_LIFE_MS = 12000;
-
-  /**
-   * 拍子布局。必须与服务端的 buildSlots 完全一致。
-   * edge = 贴哪条边；team = 属于哪一队（决定配色与共享的道具效果）；span = 中心活动范围。
-   * 客户端原本用不到 span（位置是服务端算好的），但**本地预测**需要它 ——
-   * 不然 coop 里上半场那个玩家能把自己的拍子推出半场。
-   */
-  function slotsFor(mode, h) {
-    if (mode === 'coop') {
-      return [
-        { edge: 'left', team: 0, span: [0, h / 2] },
-        { edge: 'left', team: 0, span: [h / 2, h] },
-        { edge: 'right', team: 1, span: [0, h] }
-      ];
-    }
-    return [
-      { edge: 'left', team: 0, span: [0, h] },
-      { edge: 'right', team: 1, span: [0, h] }
-    ];
-  }
-
-  var COL = {
-    court: '#0d1220',
-    wall: '#1b2540',
-    mid: '#1e2a42',
-    p0: '#4da3ff',
-    p1: '#ff7a59',
-    ball: '#eef4ff',
-    text: '#8fa3bf',
-    faint: '#5b6b88',
-    good: '#4ade80'
-  };
-
-  /**
-   * coop 专用配色：**按槽位**取色，不是按队伍。
-   * 经典模式里两侧各是一队，一队一个颜色就够了；但 coop 里两名真人站在**同一条边**上、
-   * 只是各守半场 —— 沿用"按队配色"的话两人会是一模一样的蓝，根本分不清谁是谁。
-   * 顺序固定为 [上半场, 下半场, AI]，两个客户端看到的颜色一致（不是"各自眼里的自己一个色"），
-   * 这样一边喊"你往左一点"时，双方指的确实是同一条拍子。
-   * 蓝 / 黄绿 / 橙红 三色在深色场地上两两都拉得开。
-   */
-  var COOP_COL = ['#4da3ff', '#a3e635', '#ff7a59'];
-  // 被冰冻时整体换冰色（仍然保持三条互不相同，否则冻住之后又分不清了）
-  var COOP_COL_FROZEN = ['#9fd8ff', '#dcffa8', '#ffc0ae'];
-
-  // 道具外观：索引与服务端的类型编号一一对应。
-  // 都只用几何符号和 ASCII（❄ 除外），不用 emoji —— emoji 在很多字体下会被渲染成
-  // 彩色图形，和这里的扁平风格冲突，而且尺寸不可控。
-  var POWERUP_STYLE = [
-    { c: '#4ade80', label: '+' },    // 0 加长自己的拍子
-    { c: '#f87171', label: '–' },    // 1 削短对方的拍子
-    { c: '#fbbf24', label: '»' },    // 2 球加速
-    { c: '#7dd3fc', label: '❄' },    // 3 冰冻对方的拍子
-    { c: '#a78bfa', label: '◍' },    // 4 护盾：挡一次失分
-    { c: '#f0abfc', label: '2×' },   // 5 双倍得分（8 秒内自己进球算两分）
-    { c: '#5eead4', label: '~' },    // 6 弧线球（球一路拐弯，轨迹发飘）
-    { c: '#fdba74', label: 'Y' },    // 7 分裂球（原球不变，多出一个半速的球）
-    // 8 隐形球。用"近乎无色的白"是有意的：其它八款都是饱和色，
-    // 只有它是"没有颜色"，一眼就读得出这是"让东西看不见"的那一款。
-    { c: '#e2e8f0', label: '◌' }
-  ];
-  var LEVEL_NAMES = ['简单', '普通', '困难'];
-
-  /* 道具的一句话简介（给玩家看的，和 POWERUP_STYLE 一一对应）。
-     与服务端 castPowerup 的实际效果对齐；改效果时**必须同时改这里**，
-     否则玩家读到的是说明书、打起来是另一回事。 */
-  var POWERUP_DESC = [
-    '自己拍子变长，好接球',
-    '对手拍子变短，容易漏',
-    '球加速飞出去',
-    '冻住对手拍子一会儿',
-    '挡一次失分（对方进球不算）',
-    '8 秒内自己进球算两分',
-    '球一路拐弯，轨迹发飘',
-    '多出一个半速的球，两个都算',
-    '自己这队的球一会儿看不见'
-  ];
-
-  // ---------- 拍子皮肤（颜色 = 技能） ----------
-  // 下标必须与服务端的 SKINS 一一对应：
-  //   0 灰（无技能）/ 1 青（风）/ 2 黄（幻影）/ 3 红（超高速）/
-  //   4 蓝（粘球）/ 5 黑（黑洞）/ 6 紫（乱弹）/ 7 白（道具封锁）/ 8 橙（减速）
-  var SKIN_NAMES = ['灰', '青', '黄', '红', '蓝', '黑', '紫', '白', '橙'];
-  var SKIN_DESC = ['无技能', '风', '幻影', '超高速', '粘球', '黑洞', '乱弹', '封锁', '减速'];
-  // 按钮上写的字（灰没有按钮，空着）—— 一律**单字**，按钮只有 38px 宽。
-  var SKIN_GLYPH = ['', '风', '幻', '速', '粘', '洞', '乱', '封', '缓'];
-  // 技能说明。★ 写在**选择面板自己那一块**里（而不是下面一行小字），
-  //   因为九种皮肤靠一行提示根本讲不完，而玩家选的时候需要看到它到底干什么。
-  var SKIN_TIP = [
-    '没有技能，靠手感硬打。',
-    '放一阵风推球，1 秒；朝对面球门中心吹。',
-    '放个幻影球，5 秒；对手会看见两个球。',
-    '下一板击球超高速（比普通上限还快）。',
-    '下一板把球粘住，1 秒后朝对面平推出去。',
-    '自己半场开黑洞，球从对面半场随机飞出。',
-    '10 秒内自己击球角度速度都乱，多半加速。',
-    '对手下一个吃到的道具直接失效。',
-    '对手拍子变慢 30%，2 秒。'
-  ];
-  // 服务端配色必须能一眼对应上。
-  // ★ 蓝/黑/紫/白/橙这五款要能和既有的青/黄/红区分开，所以都取了名实相符的正色：
-  //   蓝用粘胶的湖蓝（不是青）、黑用近黑的墨色（在深色球场上有描边才看得见）、
-  //   紫用乱弹的紫罗兰、白用封锁的灰白、橙用减速的橙黄。
-  var SKIN_COL = ['#8a93a6', '#22d3ee', '#fbbf24', '#ef4444', '#3b82f6', '#64748b', '#a855f7', '#e2e8f0', '#fb923c'];
-  // 被冰冻时整体换冰色，但仍然保持九个皮肤互不相同（否则冻住之后又分不清了）
-  var SKIN_COL_FROZEN = ['#9fb0c8', '#9fe8f5', '#f5dfa0', '#f0a8a8', '#a8c8f0', '#aab4c4', '#d0b0f0', '#eef2f8', '#f8d0a0'];
-  // ★ 必须与服务端的 SKILL_CD_MS 一致。只用来画冷却环（--p 的分子），
-  //   能不能放、还剩多久都以服务端下发的 sc 为准 —— 这里错了只会让环画得不圆。
-  var SKIN_CD_S = [0, 10, 15, 10, 10, 10, 15, 10, 10];
-
-  var skillBtnEls = [
-    document.getElementById('skillBtn0'),
-    document.getElementById('skillBtn1'),
-    document.getElementById('skillBtn2')
-  ];
+  // ---------- 应用上下文 ----------
+  // 共享状态、只读表和 DOM 句柄都在 public/js/context.js 里，由它一次性造出来。
+  // 下面这一排是**只读**的别名：它们从建好之后就再也不会被重新赋值，
+  // 所以在这里取一份局部引用和直接读 app.COL 完全等价，diff 也小得多。
+  var app = PongApp.createContext(document);
+  PongApp.audio(app);   // 必须最先：它注册的是 capture 相位的解锁监听器
+  PongApp.input(app);  // 其次：键盘 / 触摸
+  var slotsFor = app.slotsFor;
+  var view = app.view;
+  var dom = app.dom;
+  var canvas = dom.canvas;
+  var ctx = dom.ctx;
+  var overlay = dom.overlay;
+  var overlayBody = dom.overlayBody;
+  var netBadge = dom.netBadge;
+  var pauseBtn = dom.pauseBtn;
+  var stage = dom.stage;
+  var skillBtnEls = dom.skillBtnEls;
+  // 取证面板上那几个量表（诊断模块用）
+  var elTransport = dom.elTransport;
+  var elRtt = dom.elRtt;
+  var elRate = dom.elRate;
+  var elTickRate = dom.elTickRate;
+  var elSnaps = dom.elSnaps;
+  var elDrops = dom.elDrops;
+  var elVerdict = dom.elVerdict;
+  var pingPill = dom.pingPill;
+  var COL = app.COL;
+  var COOP_COL = app.COOP_COL;
+  var COOP_COL_FROZEN = app.COOP_COL_FROZEN;
+  var POWERUP_STYLE = app.POWERUP_STYLE;
+  var POWERUP_DESC = app.POWERUP_DESC;
+  var POWERUP_R = app.POWERUP_R;
+  var POWERUP_MAX = app.POWERUP_MAX;
+  var LEVEL_NAMES = app.LEVEL_NAMES;
+  var SKIN_NAMES = app.SKIN_NAMES;
+  var SKIN_DESC = app.SKIN_DESC;
+  var SKIN_GLYPH = app.SKIN_GLYPH;
+  var SKIN_TIP = app.SKIN_TIP;
+  var SKIN_COL = app.SKIN_COL;
+  var SKIN_COL_FROZEN = app.SKIN_COL_FROZEN;
+  var SKIN_CD_S = app.SKIN_CD_S;
+  var WIN_SCORE = app.WIN_SCORE;
+  var WIN_MARGIN = app.WIN_MARGIN;
+  var WIND_MS = app.WIND_MS;
+  var HOLE_R = app.HOLE_R;
+  var HOLE_LIFE_MS = app.HOLE_LIFE_MS;
+  var PADDLE_W = app.PADDLE_W;
+  var PADDLE_H = app.PADDLE_H;
+  var PADDLE_MARGIN = app.PADDLE_MARGIN;
+  var BALL_R = app.BALL_R;
+  var PADDLE_SPEED = app.PADDLE_SPEED;
 
   // ---------- 我选的皮肤 ----------
   // 存在本机（localStorage）而不是服务端：它是"我的偏好"，换房间、换对手都该跟着我走。
@@ -257,102 +177,9 @@
   }
   var mySkin = readSkin();
 
-  var canvas = document.getElementById('game');
-  var ctx = canvas.getContext('2d');
-  var overlay = document.getElementById('overlay');
-  var overlayBody = document.getElementById('overlayBody');
-  var netBadge = document.getElementById('netBadge');
-  var pauseBtn = document.getElementById('pauseBtn');
-
-  // ---------- 视图状态 ----------
-  var view = {
-    mySide: -1,
-    code: '',
-    connected: false,
-    wsUrl: '',
-    extensions: '',
-    handshakeMs: 0,
-
-    mode: 'duel',             // duel | solo | coop
-    slots: slotsFor('duel', H),
-    phase: 'waiting',
-    // 真人主动暂停。★ 与 phase 是**两个独立状态**：暂停期间 phase 还是 playing，
-    //   画面上球还在（只是冻住不动）—— 若把它并进 phase 走 waiting 分支，那条分支
-    //   压根不画球，一按暂停球就从画面上消失，看着像球被吞了。
-    userPaused: false,
-    pausedBy: -1,             // 是谁按的（槽位号，-1 = 没暂停）
-    // ★ 球是一个**数组**（分裂球会让场上同时有多个）。
-    //   服务端每个球都带 id，客户端按 id 维护它的平滑位置和尾迹 ——
-    //   不能用下标当身份：某个球出界后数组整体前移，剩下的球会被
-    //   从"上一个球的位置"平滑地滑过去，看起来像瞬移。
-    balls: [],                // 服务端真值 [{ id, x, y }]
-    ballDisps: {},            // id -> { x, y } 画出来的位置（指数平滑，抹平 30Hz 台阶）
-    tails: {},                // id -> [{x,y}] 弧线球尾迹
-    paddles: [H / 2, H / 2],
-    paddleDisp: [H / 2, H / 2],
-    paddleMul: [1, 1],        // 拍子长度倍率，决定画多长
-    powerups: [],             // 场上道具数组 [[x, y, type], ...] —— 可以同时有多个
-    freeze: [0, 0],           // 各队冰冻剩余秒数（>0 就是被冻着）
-    shield: [0, 0],           // 各队护盾剩余层数
-    double: [0, 0],           // 各队双倍得分是否生效
-    invis: [0, 0],            // 各队"看不见球"还剩几秒（>0 就是被隐形了）
-    invisAlpha: [1, 1],       // 各队**当前看到的球**的不透明度（1 看得见 / 0 看不见）
-    curve: 0,                 // 弧线球：非 0 表示球在拐弯（值是带符号的角速度）
-    // 皮肤与技能。★ 全部按**槽位**（不是按队）：coop 里左边两个人同队，但各有各的技能。
-    skins: [0, 0],            // 各槽位的皮肤（0 灰 / 1 青 / 2 黄 / 3 红）
-    skillCd: [0, 0],          // 各槽位技能冷却剩余秒数（0 = 可以放）
-    boostArmed: [0, 0],       // 各槽位"下次击球超高速"是否已经蓄好力
-    winds: [],                // 正在刮的风 [[dx, dy, 剩余秒], ...]（可以同时有多股）
-    phantom: [0, 0],          // 各队幻影球还剩几秒（只给释放方看，给的是"还在生效"的反馈）
-    // ---- 第 11 轮五种新技能的对外状态（全部由服务端下发，客户端只负责画） ----
-    stickArmed: [],           // 各槽位"下一板会粘住球"是否已武装
-    stuckBall: 0,             // 正被粘住的球 [x, y, 槽位] 或 0（画的时候要硬贴在拍子上）
-    holes: [],                // 黑洞 [[x, y, 剩余秒, 队伍], ...]
-    chaos: [],                // 各槽位"乱弹"还剩几秒
-    blockCharges: [],         // 各队还有几层道具封锁（对手那一格服务端会抹成 0）
-    slowLeft: [],             // 各队拍子被减速还剩几秒
-    canReselect: false,       // 局间可以重新选拍子（服务端下发的窗口）
-    solo: false,              // 对手是 AI
-    coop: false,              // 双人对抗 AI
-    botLevel: 1,
-    botName: '',
-    score: [0, 0],
-    present: [0, 0],
-    winner: -1,
-    serverTick: 0,
-    countdownMs: 0,
-
-    dir: 0,
-
-    rtt: 0,
-    rttSum: 0,
-    rttCount: 0,
-    snaps: 0,
-    lastSnapAt: 0,
-    matchId: '',
-    matchFrames: [],
-    matchFrameLimit: 18000,
-    matchFrameNo: 0,
-    reportedMatchId: '',
-    serverClockOffset: 0,
-    serverClockSynced: false,
-    clockSyncRtt: Infinity,
-    lastSnapshotServerTime: 0,
-    pendingPingWall: Object.create(null),
-    intervals: [],
-    drops: 0,
-    lastTick: 0,
-    lastTickAt: 0,
-    tickRate: 0,
-    tkWinStart: 0,      // 频率统计窗口的起点时刻
-    tkWinBase: 0        // 窗口起点处的 tick 值
-  };
 
   var sock = null;
-  var sentDir = -99;
   var aiLevel = 1;            // AI 难度，默认"普通"；单人和双人两个 AI 模式共用
-  var touchTargetY = null;
-  var keys = { up: false, down: false };
   var retryTimer = null;
   var retryDelay = 800;
   var closingByUs = false;
@@ -546,8 +373,8 @@
 
   function setMode(mode, wh) {
     view.mode = mode || 'duel';
-    if (wh && wh.length === 2) { W = wh[0]; H = wh[1]; }
-    view.slots = slotsFor(view.mode, H);
+    if (wh && wh.length === 2) { view.W = wh[0]; view.H = wh[1]; }
+    view.slots = slotsFor(view.mode, view.H);
     view.coop = view.mode === 'coop';
     view.solo = view.mode !== 'duel';
     // 位置也要跟着重置。只调数组长度、留着上一局的残留位置的话，
@@ -565,7 +392,7 @@
     view.boostArmed = view.slots.map(function () { return 0; });
     view.winds = [];
     view.phantom = [0, 0];
-    // ★★ 必须**立刻**把画布尺寸同步过来。只改 W/H 而不重设 canvas 的话，会留下一帧
+    // ★★ 必须**立刻**把画布尺寸同步过来。只改 view.W/view.H 而不重设 canvas 的话，会留下一帧
     //   「场地已经是新模式的尺寸、画布还是旧的」的状态：
     //     · 那 16ms 里画面比例是错的（coop 的 960×800 会被画进 800×500 的位图里）；
     //     · 页面用来定场地比例的 CSS 变量 --ar 也跟着滞后一帧；
@@ -573,241 +400,6 @@
     //   fitCanvas() 是幂等的（尺寸没变就不动 canvas），所以放在这里没有副作用。
     fitCanvas();
   }
-
-  // ================= 声音 =================
-  // 全部用 Web Audio 实时合成，不引任何音频文件。
-  // 理由：音效是"几十毫秒的短音"，用文件反而要处理加载时机和延迟，
-  //       合成是零加载、零额外资源、时间精确。
-  var audioCtx = null;
-  var soundOn = true;
-
-  function ac() {
-    if (!audioCtx) {
-      var Ctor = window.AudioContext || window.webkitAudioContext;
-      if (!Ctor) return null;
-      try { audioCtx = new Ctor(); } catch (e) { return null; }
-    }
-    if (audioCtx.state === 'suspended') {
-      var r = audioCtx.resume();
-      if (r && r.catch) r.catch(function () {});
-    }
-    return audioCtx;
-  }
-
-  /**
-   * 合成一声短音。
-   * 频率用指数滑音（exponentialRamp）而不是线性：听感上滑音才是均匀的。
-   * 包络两端都留 0.0001 而不是 0 —— 指数插值的目标值不能是 0，否则会抛错。
-   */
-  function blip(o) {
-    if (!soundOn) return;
-    var c = ac();
-    if (!c) return;
-    var t0 = c.currentTime + (o.delay || 0);
-    var dur = o.dur || 0.08;
-    var osc = c.createOscillator();
-    var g = c.createGain();
-    osc.type = o.type || 'square';
-    osc.frequency.setValueAtTime(o.freq, t0);
-    if (o.sweep) osc.frequency.exponentialRampToValueAtTime(o.sweep, t0 + dur);
-    g.gain.setValueAtTime(0.0001, t0);
-    g.gain.exponentialRampToValueAtTime(o.gain || 0.12, t0 + 0.008);
-    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
-    osc.connect(g);
-    g.connect(c.destination);
-    osc.start(t0);
-    osc.stop(t0 + dur + 0.03);
-  }
-
-  function sfxHit() {
-    // 每下略微变调，连打时不会像复读机
-    var f = 430 + Math.random() * 70;
-    blip({ freq: f, sweep: f * 0.55, type: 'square', dur: 0.055, gain: 0.075 });
-  }
-  function sfxScore() {
-    blip({ freq: 320, sweep: 170, type: 'triangle', dur: 0.16, gain: 0.13 });
-    blip({ freq: 210, sweep: 120, type: 'triangle', dur: 0.22, gain: 0.1, delay: 0.1 });
-  }
-  function sfxPower(mine) {
-    if (mine) {
-      blip({ freq: 540, sweep: 820, type: 'sine', dur: 0.09, gain: 0.11 });
-      blip({ freq: 820, sweep: 1180, type: 'sine', dur: 0.13, gain: 0.1, delay: 0.075 });
-    } else {
-      // 对手吃到道具：给一个低沉的提醒，别让人以为是自己拿到了
-      blip({ freq: 300, sweep: 220, type: 'sine', dur: 0.14, gain: 0.08 });
-    }
-  }
-  function sfxSave(mine) {
-    // 护盾救球：上滑的清脆音。必须和普通击球明显不同，
-    // 否则玩家分不清"我打到了球"和"我的护盾替我挡了一分"。
-    var f = mine ? 700 : 520;
-    blip({ freq: f, sweep: f * 1.8, type: 'sine', dur: 0.13, gain: 0.1 });
-  }
-  function sfxDouble(mine) {
-    // 双倍得分：两声短促上行，提示"这一分算了两分"
-    var f = mine ? 620 : 440;
-    blip({ freq: f, sweep: f, type: 'triangle', dur: 0.09, gain: 0.11 });
-    blip({ freq: f * 1.5, sweep: f * 1.5, type: 'triangle', dur: 0.12, gain: 0.11, delay: 0.08 });
-  }
-  /**
-   * 有人按了暂停 / 继续。
-   * ★ 两端都会响：对面按下暂停时你也该听得出来，否则你只会觉得"球怎么忽然不动了"。
-   *   暂停用下行音、继续用上行音，方向本身就把状态说清楚了。
-   */
-  function sfxPause(on) {
-    var f = on ? 520 : 380;
-    blip({ freq: f, sweep: on ? f * 0.6 : f * 1.7, type: 'sine', dur: 0.13, gain: 0.09 });
-  }
-  /**
-   * 有人放了技能。三种技能给三种音色，别人放的给一个低一号的版本 ——
-   * 和 sfxPower 一个道理：分不清"我放的"和"他放的"会让整个技能系统没有实感。
-   * @param {number} skin 皮肤编号（1 青 / 2 黄 / 3 红）
-   * @param {boolean} mine 是不是我放的
-   */
-  function sfxSkill(skin, mine) {
-    var lift = mine ? 1 : 0.72;
-    if (skin === 1) {
-      // 风：一片"呼"上来的气流声（低→高再回落，像一阵风掠过）
-      blip({ freq: 240 * lift, sweep: 700 * lift, type: 'sine', dur: 0.30, gain: 0.075 });
-      blip({ freq: 420 * lift, sweep: 300 * lift, type: 'sine', dur: 0.26, gain: 0.05, delay: 0.14 });
-    } else if (skin === 2) {
-      // 幻影：两下几乎重合的音，听感上就是"分裂"了
-      blip({ freq: 600 * lift, sweep: 900 * lift, type: 'triangle', dur: 0.10, gain: 0.10 });
-      blip({ freq: 615 * lift, sweep: 915 * lift, type: 'triangle', dur: 0.10, gain: 0.09, delay: 0.05 });
-    } else if (skin === 3) {
-      // 超高速：蓄力音，一串紧凑的上行
-      blip({ freq: 380 * lift, sweep: 1150 * lift, type: 'square', dur: 0.19, gain: 0.075 });
-    }
-  }
-  /** 超高速真的打出去了。必须和普通击球明显不同，否则玩家不知道那一板生效了 */
-  function sfxBoost(mine) {
-    var f = mine ? 900 : 660;
-    blip({ freq: f, sweep: f * 0.45, type: 'square', dur: 0.09, gain: 0.11 });
-  }
-  function sfxOver(won) {
-    if (won) {
-      blip({ freq: 520, sweep: 520, type: 'triangle', dur: 0.14, gain: 0.12 });
-      blip({ freq: 660, sweep: 660, type: 'triangle', dur: 0.14, gain: 0.12, delay: 0.13 });
-      blip({ freq: 880, sweep: 880, type: 'triangle', dur: 0.28, gain: 0.13, delay: 0.26 });
-    } else {
-      blip({ freq: 400, sweep: 380, type: 'triangle', dur: 0.18, gain: 0.1 });
-      blip({ freq: 280, sweep: 200, type: 'triangle', dur: 0.3, gain: 0.1, delay: 0.16 });
-    }
-  }
-
-  /** 服务端在快照里带下来的离散事件 → 对应音效 */
-  function playEvent(code) {
-    var kind = code.charAt(0);
-    if (kind === 'h') {
-      sfxHit();
-    } else if (kind === 'g') {
-      sfxScore();
-    } else if (kind === 'u') {
-      var who = Number(code.charAt(1));
-      sfxPower(who === view.mySide);
-    } else if (kind === 'k') {
-      sfxSave(Number(code.charAt(1)) === view.mySide);      // 护盾挡下一分
-    } else if (kind === 'x') {
-      sfxDouble(Number(code.charAt(1)) === view.mySide);    // 这一分是双倍
-    } else if (kind === 'o') {
-      sfxOver(Number(code.charAt(1)) === view.mySide);
-    } else if (kind === 'p') {
-      sfxPause(code.charAt(1) === 'p');     // pp = 暂停，pr = 继续
-    } else if (kind === 'v') {
-      // v + 槽位 + 皮肤：放技能
-      sfxSkill(Number(code.charAt(2)) || 0, Number(code.charAt(1)) === view.mySide);
-    } else if (kind === 'y') {
-      // y + 槽位：这一板是超高速
-      sfxBoost(Number(code.charAt(1)) === view.mySide);
-    }
-  }
-
-  // ---------- 背景音乐 ----------
-  // ★ 不用 base64 内嵌：这首 mp3 有 7MB，内嵌会让 HTML 涨到 10MB，
-  //   打开先愣几秒。放成独立文件用相对路径引，浏览器按 Range 分段取，边下边放。
-  var BGM_SRC = 'audio/bgm-ramble.mp3';
-  // base 是"目标音量"。用户反馈偏大，从 0.30 调到 0.24（约 −20%，听感上是小半档）。
-  var BGM = { el: null, base: 0.24, cur: 0, ready: false, failed: false };
-
-  function bgmInit() {
-    if (BGM.el) return;
-    var el = document.createElement('audio');
-    el.src = BGM_SRC;
-    el.loop = true;
-    el.preload = 'auto';
-    el.volume = 0;
-    el.addEventListener('canplaythrough', function () { BGM.ready = true; });
-    // 音乐加载失败绝不能影响游戏：只是没声音，比赛照常
-    el.addEventListener('error', function () { BGM.failed = true; BGM.ready = false; });
-    BGM.el = el;
-  }
-
-  /**
-   * 自动播放闸门。
-   * Chromium 在页面拿到用户手势之前不许出声，play() 返回的是被拒的 Promise
-   * （不抛异常，忘了 catch 就是一条 unhandled rejection）。
-   * 所以初始化时试一次是不够的 —— 必须挂到每次交互上重试。
-   * 内部先判 paused，挂在热路径上也只是一次属性读，不需要 once 标记。
-   */
-  function bgmArm() {
-    if (!soundOn) return;
-    bgmInit();
-    if (!BGM.el || !BGM.el.paused) return;
-    var p = BGM.el.play();
-    if (p && p.catch) p.catch(function () {});
-  }
-
-  window.addEventListener('pointerdown', bgmArm, true);   // capture：不被 stopPropagation 挡掉
-  window.addEventListener('keydown', bgmArm, true);
-  window.addEventListener('touchstart', bgmArm, true);
-
-  function bgmTarget() {
-    if (!soundOn || BGM.failed) return 0;
-    return BGM.base;
-  }
-
-  /** 音量状态机：由游戏状态算出目标，每帧让实际值逼近它。淡入/静音都走这一条路 */
-  function bgmTick(rdt) {
-    var el = BGM.el;
-    if (!el) return;
-
-    // ★ 没在播的时候音量必须恒为 0。被自动播放策略拦住的这段时间里如果照常推进，
-    //   cur 会悄悄爬到满值，用户第一次点击就是"啪"一下满音量起播，淡入等于白写。
-    if (el.paused) { BGM.cur = 0; el.volume = 0; return; }
-
-    var want = bgmTarget();
-    // 两档时间常数：还没爬到一半用慢档（这就是淡入），过半转快档收尾。
-    // 判据必须是相对量 —— 写成 cur < 0.02 这种固定小值，一超过就跳快档，等于没淡入。
-    var tau = (want > BGM.cur && BGM.cur < BGM.base * 0.5) ? 0.6 : 0.14;
-    BGM.cur += (want - BGM.cur) * (1 - Math.exp(-rdt / tau));
-    if (BGM.cur < 0.005) BGM.cur = 0;      // 指数逼近永远到不了 0，-46dB 直接钳零
-    el.volume = Math.min(1, Math.max(0, BGM.cur));
-  }
-
-  document.addEventListener('visibilitychange', function () {
-    if (!BGM.el) return;
-    if (document.hidden) BGM.el.pause();    // 切走就停：省电，也免得以为还在跑
-    else bgmArm();
-  });
-
-  function bgmSyncUI() {
-    var btn = document.getElementById('sfxBtn');
-    if (!btn) return;
-    btn.textContent = soundOn ? '🔊' : '🔇';
-    btn.className = 'soundbtn' + (soundOn ? '' : ' off');
-  }
-
-  function toggleSound() {
-    soundOn = !soundOn;
-    if (soundOn) bgmArm();
-    bgmSyncUI();
-  }
-
-  (function initSoundUI() {
-    var btn = document.getElementById('sfxBtn');
-    if (btn) btn.onclick = function () { toggleSound(); };
-    bgmSyncUI();
-  })();
 
   // ---------- 会话（用于断线重连） ----------
   // 用 sessionStorage 而不是 localStorage：座位属于「这个标签页」。
@@ -833,16 +425,15 @@
 
   // ---------- 画布尺寸 ----------
   var dpr = 1;
-  var stage = document.querySelector('.stage');
   function fitCanvas() {
     var want = Math.min(window.devicePixelRatio || 1, 2);
     dpr = want;
-    if (canvas.width !== W * dpr || canvas.height !== H * dpr) {
-      canvas.width = W * dpr;
-      canvas.height = H * dpr;
+    if (canvas.width !== view.W * dpr || canvas.height !== view.H * dpr) {
+      canvas.width = view.W * dpr;
+      canvas.height = view.H * dpr;
     }
     // 宽高比交给 CSS 变量：各模式的场地尺寸不同，写死 8/5 会把 coop 压扁
-    if (stage) stage.style.setProperty('--ar', (W / H).toFixed(4));
+    if (stage) stage.style.setProperty('--ar', (view.W / view.H).toFixed(4));
   }
 
   // ---------- 网络 ----------
@@ -905,7 +496,7 @@
       view.handshakeMs = Math.round(performance.now() - startedAt);
       view.extensions = sock.extensions || '';
       retryDelay = 800;
-      sentDir = -99;
+      app.input.resetSentDir();   // 换连接了，朝向要重新报一次，别让去重把它吃掉
       setBadge('已连接', 'ok');
       startPing();
       onConnected();
@@ -986,6 +577,11 @@
     }
   }
 
+  // 网络模块还没搬出去（Phase 8 的下一步），先把发包入口挂到 app.net 上，
+  // 让已经拆出去的 input 模块能通过 app.net.send(...) 找到它 ——
+  // 这是模块间唯一的通信方式，不给临时全局。
+  app.net = { send: send };
+
   /** 连接就绪后补发攒下的意图；真发了东西就返回 true */
   function flushPending() {
     if (pendingTimer) { clearTimeout(pendingTimer); pendingTimer = null; }
@@ -1062,7 +658,7 @@
 
         // 场地尺寸每帧随包下发。尺寸变了说明模式变了（例如刷新后重连进的是另一个模式），
         // 这时要把整个布局换掉 —— 否则会拿旧场地的坐标去画新场地。
-        if (m.wh && (W !== m.wh[0] || H !== m.wh[1])) setMode(m.md || view.mode, m.wh);
+        if (m.wh && (view.W !== m.wh[0] || view.H !== m.wh[1])) setMode(m.md || view.mode, m.wh);
         else if (m.md && m.md !== view.mode) setMode(m.md, m.wh);
 
         if (m.mi && m.mi !== view.matchId) {
@@ -1121,7 +717,7 @@
         // 事件是"这一批快照里发生的事"，服务端发完即清。
         // 主循环一轮可能推进多个 tick 才广播一次，所以这里可能一次收到多个事件。
         if (m.ev && m.ev.length) {
-          for (var ei = 0; ei < m.ev.length; ei += 1) playEvent(m.ev[ei]);
+          for (var ei = 0; ei < m.ev.length; ei += 1) app.audio.playEvent(m.ev[ei]);
         }
 
         if (m.k !== view.lastTick) {
@@ -1163,141 +759,6 @@
       default: break;
     }
   }
-
-  // ---------- 输入 ----------
-  function setDir(d) {
-    if (d !== -1 && d !== 0 && d !== 1) d = 0;
-    view.dir = d;
-    if (d !== sentDir) {
-      sentDir = d;
-      send({ t: 'input', dir: d });
-    }
-  }
-
-  function dirFromKeys() {
-    var d = 0;
-    if (keys.up) d -= 1;
-    if (keys.down) d += 1;
-    return d;
-  }
-
-  /**
-   * 上报一次「暂停 / 继续」。按钮和 P 键都走这里，语义只有一条：
-   * **按一下算一下**，切换成什么状态由服务端决定（快照里的 up / pb 才是真值）。
-   * 没入座、或者比赛还没跑起来（waiting）时不发 —— 与按钮的显示条件、以及服务端
-   * 那句 `room.started &&` 前提保持一致。
-   */
-  function requestPause() {
-    if (view.mySide < 0 || view.phase === 'waiting') return;
-    send({ t: 'pause' });
-  }
-
-  /**
-   * 上报一次「放技能」。按钮、Q 键、手机点按都走这里。
-   *
-   * ★ 这里的两道前置检查（有没有技能、在不在冷却）**只是省一次白跑的往返**，
-   *   真正的门禁全在服务端（castSkill）。所以它们算错也只会多/少发一条消息，
-   *   不会让"放不出来"或者"放出来两次"这种真问题溜过去。
-   * ★ 不做任何乐观更新：按钮上的字和冷却环一律等快照回来再变，
-   *   和暂停按钮同一个理由 —— 两个人同时按的时候，乐观看的状态和真值会分叉。
-   */
-  function requestSkill() {
-    // 服务端的门禁是"必须 playing"，这里跟着一起挡 —— 倒计时/结束期间按下去
-    // 只会白跑一趟，按钮却会闪一下像放出去了
-    if (view.mySide < 0 || view.phase !== 'playing') return;
-    var skin = view.skins[view.mySide];
-    if (!(skin > 0)) return;                                  // 灰板子没有技能
-    if ((view.skillCd[view.mySide] || 0) > 0.05) return;       // 冷却中
-    send({ t: 'skill' });
-  }
-
-  function onKey(e, down) {
-    var k = e.key;
-    // ★ 正在输入框里打字时，任何单键快捷键都不该生效。房间码输入框是真实存在的：
-    //   在里头敲房间码时按到 m / p，会被当成"静音 / 暂停"——静音那条是本来就有的毛病，
-    //   顺手一起挡住。（Enter 提交房间码由输入框自己的 onkeydown 管，不经过这里。）
-    var tg = e.target;
-    if (tg && (tg.tagName === 'INPUT' || tg.tagName === 'TEXTAREA' || tg.isContentEditable)) return;
-    // 静音键放在最前面：否则开局的覆盖层会把后面的分支顺序影响掉
-    if (down && (k === 'm' || k === 'M')) { toggleSound(); return; }
-    // 暂停快捷键。和点按钮走同一条路（只上报意图，界面状态等服务端回话）
-    if (down && (k === 'p' || k === 'P')) { requestPause(); return; }
-    // 技能快捷键（电脑端）。手机端靠点那个按钮，不走键盘。
-    if (down && (k === 'q' || k === 'Q')) { requestSkill(); return; }
-    var isUp = (k === 'ArrowUp' || k === 'w' || k === 'W');
-    var isDown = (k === 'ArrowDown' || k === 's' || k === 'S');
-    if (!isUp && !isDown) return;
-    e.preventDefault();
-    if (isUp) keys.up = down;
-    if (isDown) keys.down = down;
-    touchTargetY = null;
-    if (view.mySide >= 0) setDir(dirFromKeys());
-  }
-
-  window.addEventListener('keydown', function (e) { onKey(e, true); });
-  window.addEventListener('keyup', function (e) { onKey(e, false); });
-  window.addEventListener('blur', function () {
-    keys.up = false; keys.down = false;
-    setDir(0);
-  });
-
-  // ---------- 触屏 ----------
-  // ★ 绑在 window 上而不是 canvas 上。原因有两个，都是手机上真会遇到的事：
-  //   1. 手机横屏时球场两侧各有一段留白（球场固定 1.6，屏幕普遍更宽），
-  //      拇指落在**自己拍子左边**那片留白里时，以前完全没有反应；
-  //   2. 手正压在拍子上拨，手掌就把球挡掉一半。
-  //   现在整屏任何位置按下都能拖，玩家可以把手指挪到旁边不碍事的地方。
-  //   只排除真正的点击目标（按钮 / 菜单 / 常驻栏 / 横屏提示），免得把点击抢成拖动。
-  var touchActive = false;
-
-  function touchHitsUI(target) {
-    return !!(target && target.closest
-      && target.closest('button, a, input, select, textarea, .overlay, .panelbox, .solobar, .rotatetip'));
-  }
-
-  function touchY(ev) {
-    var t = ev.touches && ev.touches[0];
-    if (!t) return null;
-    var rect = canvas.getBoundingClientRect();
-    if (!rect.height) return null;
-    // 落点允许高于/低于球场：夹到 [0, H]，等价于把拍子推到顶/底。
-    // 不夹的话在竖屏（画布上下留白很大）会算出一个离谱的目标值。
-    var y = (t.clientY - rect.top) / rect.height * H;
-    if (!isFinite(y)) return null;
-    return Math.max(0, Math.min(H, y));
-  }
-
-  function onTouchStart(e) {
-    if (view.mySide < 0) return;
-    if (touchHitsUI(e.target)) return;
-    var y = touchY(e);
-    if (y === null) return;
-    touchActive = true;
-    touchTargetY = y;
-    e.preventDefault();
-  }
-
-  function onTouchMove(e) {
-    if (!touchActive) return;
-    if (view.mySide < 0) { touchActive = false; return; }
-    var y = touchY(e);
-    if (y === null) return;
-    touchTargetY = y;
-    e.preventDefault();
-  }
-
-  function onTouchEnd(e) {
-    if (!touchActive) return;
-    touchActive = false;
-    touchTargetY = null;
-    setDir(0);
-    if (e && e.cancelable) e.preventDefault();
-  }
-
-  window.addEventListener('touchstart', onTouchStart, { passive: false });
-  window.addEventListener('touchmove', onTouchMove, { passive: false });
-  window.addEventListener('touchend', onTouchEnd);
-  window.addEventListener('touchcancel', onTouchEnd);
 
   // ---------- 界面切换 ----------
   /**
@@ -1752,7 +1213,7 @@
           // 别人的按钮本来就点不到（pointer-events:none），这里再挡一道，
           // 免得以后有人手滑把那条 CSS 去掉就变成"能替对面放技能"。
           if (idx !== view.mySide) return;
-          requestSkill();
+          app.input.requestSkill();
         };
       })(i);
     }
@@ -1786,7 +1247,7 @@
     // 只上报"我按了一下"，具体切到什么状态以服务端快照为准。
     // 也正因为这样，这里不需要 disabled / 防连点 —— 连点两次就是切两次，
     // 而需求正是"每个人点都会生效"。
-    pauseBtn.onclick = function () { requestPause(); };
+    pauseBtn.onclick = function () { app.input.requestPause(); };
     syncPauseBtn();
   })();
 
@@ -1967,15 +1428,9 @@
   }
 
   // ---------- 调试面板 ----------
-  var elTransport = document.getElementById('mTransport');
-  var elRtt = document.getElementById('mRtt');
-  var elRate = document.getElementById('mRate');
-  var elTickRate = document.getElementById('mTickRate');
-  var elSnaps = document.getElementById('mSnaps');
-  var elDrops = document.getElementById('mDrops');
-  var elVerdict = document.getElementById('verdict');
-  // 手机端顶部的延迟胶囊。桌面端它是 display:none，更新它没有任何副作用。
-  var pingPill = document.getElementById('pingPill');
+
+  // 手机端顶部的延迟胶囊（句柄在上面的 dom 别名里）。桌面端它是 display:none，
+  // 更新它没有任何副作用。
 
   function renderMeters() {
     if (!view.connected) {
@@ -2150,25 +1605,27 @@
       paddleColors: view.slots.map(function (_, i) { return paddleFill(i, false); }),
       // 供探针做像素级检查。canvas 像素坐标 = 场地坐标 × dpr
       geom: {
-        court: [W, H], margin: PADDLE_MARGIN,
+        court: [view.W, view.H], margin: PADDLE_MARGIN,
         paddleW: PADDLE_W, paddleH: PADDLE_H,
-        dpr: canvas.width / W
+        dpr: canvas.width / view.W
       },
       curve: view.curve,
       botLevel: view.botLevel,
       botName: view.botName,
-      bgmBase: BGM.base,
-      bgmSrc: BGM_SRC,
+      bgmBase: app.audio.snapshot().base,
+      bgmSrc: app.audio.snapshot().src,
       winScore: WIN_SCORE,
       winMargin: WIN_MARGIN
     };
   };
 
-  // BGM 专用钩子：音频"有没有在响"是运行期状态，光看代码和截图都验不了
+  // BGM 专用钩子：音频"有没有在响"是运行期状态，光看代码和截图都验不了。
+  // 读的都是 app.audio.snapshot()，探针看到的字段和取值口径与搬动之前完全一致。
   window.__bgm = function () {
-    var el = BGM.el;
+    var a = app.audio.snapshot();
+    var el = a.el;
     if (!el) {
-      return { el: null, soundOn: soundOn, src: BGM_SRC, ready: BGM.ready, failed: BGM.failed };
+      return { el: null, soundOn: a.soundOn, src: a.src, ready: a.ready, failed: a.failed };
     }
     return {
       src: el.currentSrc || el.src,
@@ -2177,18 +1634,18 @@
       volume: Math.round(el.volume * 10000) / 10000,
       readyState: el.readyState,
       duration: Math.round((el.duration || 0) * 100) / 100,
-      cur: Math.round(BGM.cur * 10000) / 10000,
-      want: Math.round(bgmTarget() * 10000) / 10000,
-      base: BGM.base,
-      ready: BGM.ready,
-      failed: BGM.failed,
-      soundOn: soundOn,
-      ctxState: audioCtx ? audioCtx.state : null,
+      cur: Math.round(a.cur * 10000) / 10000,
+      want: Math.round(a.want * 10000) / 10000,
+      base: a.base,
+      ready: a.ready,
+      failed: a.failed,
+      soundOn: a.soundOn,
+      ctxState: a.ctxState,
       btn: (document.getElementById('sfxBtn') || {}).textContent || ''
     };
   };
-  window.__setSound = function (on) { soundOn = !!on; bgmSyncUI(); return window.__bgm(); };
-  window.__bgmSrc = function () { return BGM_SRC; };
+  window.__setSound = function (on) { app.audio.setSound(on); return window.__bgm(); };
+  window.__bgmSrc = function () { return app.audio.snapshot().src; };
 
   // ---------- 渲染 ----------
   function rr(x, y, w, h, r) {
@@ -2385,7 +1842,7 @@
     var life = Math.max(0, Math.min(1, w[2] / total));      // 1 = 刚放出，0 = 快没了
     var fade = Math.min(1, (1 - life) * 7) * Math.min(1, life * 7);
     if (fade <= 0.01) return;
-    var diag = Math.sqrt(W * W + H * H);
+    var diag = Math.sqrt(view.W * view.W + view.H * view.H);
     var phase = (performance.now() / 620 + idx * 0.37) % 1;
     ctx.save();
     ctx.lineCap = 'round';
@@ -2395,9 +1852,9 @@
       var r2 = hashF(i, 2);
       var r3 = hashF(i, 3);
       var off = (((r3 + phase) % 1) * 2 - 1) * diag;
-      var x = r1 * W + dx * off;
-      var y = r2 * H + dy * off;
-      if (x < -60 || x > W + 60 || y < -60 || y > H + 60) continue;
+      var x = r1 * view.W + dx * off;
+      var y = r2 * view.H + dy * off;
+      if (x < -60 || x > view.W + 60 || y < -60 || y > view.H + 60) continue;
       var len = 30 + r3 * 55;
       ctx.globalAlpha = fade * (0.14 + 0.30 * r1);
       ctx.lineWidth = 1.4 + r2 * 1.8;
@@ -2474,7 +1931,7 @@
     var sl = view.slots[slot];
     var x = sl.edge === 'left'
       ? PADDLE_MARGIN + PADDLE_W + 30
-      : W - PADDLE_MARGIN - PADDLE_W - 30;
+      : view.W - PADDLE_MARGIN - PADDLE_W - 30;
     ctx.font = '700 13px ui-monospace, Menlo, Consolas, monospace';
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
@@ -2488,7 +1945,7 @@
     var n = view.shield[sl.team];
     if (!n) return;
     var y = view.paddleDisp[slot];
-    var x = sl.edge === 'left' ? 7 : W - 7;
+    var x = sl.edge === 'left' ? 7 : view.W - 7;
     var half = PADDLE_H * 0.66;
 
     ctx.strokeStyle = '#38bdf8';
@@ -2523,23 +1980,23 @@
 
   function draw() {
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.clearRect(0, 0, W, H);
+    ctx.clearRect(0, 0, view.W, view.H);
 
     ctx.fillStyle = COL.court;
-    ctx.fillRect(0, 0, W, H);
+    ctx.fillRect(0, 0, view.W, view.H);
 
     // 上下墙
     ctx.fillStyle = COL.wall;
-    ctx.fillRect(0, 0, W, 3);
-    ctx.fillRect(0, H - 3, W, 3);
+    ctx.fillRect(0, 0, view.W, 3);
+    ctx.fillRect(0, view.H - 3, view.W, 3);
 
     // 中线
     ctx.setLineDash([14, 18]);
     ctx.strokeStyle = COL.mid;
     ctx.lineWidth = 3;
     ctx.beginPath();
-    ctx.moveTo(W / 2, 0);
-    ctx.lineTo(W / 2, H);
+    ctx.moveTo(view.W / 2, 0);
+    ctx.lineTo(view.W / 2, view.H);
     ctx.stroke();
     ctx.setLineDash([]);
 
@@ -2550,8 +2007,8 @@
       ctx.strokeStyle = 'rgba(77,163,255,0.30)';
       ctx.lineWidth = 2;
       ctx.beginPath();
-      ctx.moveTo(0, H / 2);
-      ctx.lineTo(W / 2, H / 2);
+      ctx.moveTo(0, view.H / 2);
+      ctx.lineTo(view.W / 2, view.H / 2);
       ctx.stroke();
       ctx.setLineDash([]);
     }
@@ -2561,23 +2018,23 @@
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.fillStyle = 'rgba(143,163,191,0.22)';
-    ctx.fillText(String(view.score[0]), W / 2 - 90, 78);
-    ctx.fillText(String(view.score[1]), W / 2 + 90, 78);
+    ctx.fillText(String(view.score[0]), view.W / 2 - 90, 78);
+    ctx.fillText(String(view.score[1]), view.W / 2 + 90, 78);
 
     // 双倍得分生效时挂在比分外侧。不加这个标记，分数一次跳两分会被当成 bug
     ctx.font = '700 15px ui-monospace, Menlo, Consolas, monospace';
     ctx.fillStyle = '#f0abfc';
-    if (view.double[0]) ctx.fillText('×2', W / 2 - 148, 78);
-    if (view.double[1]) ctx.fillText('×2', W / 2 + 148, 78);
+    if (view.double[0]) ctx.fillText('×2', view.W / 2 - 148, 78);
+    if (view.double[1]) ctx.fillText('×2', view.W / 2 + 148, 78);
 
     // AI 模式：把对手是谁写出来，免得以为在跟真人打
     if (view.solo) {
       ctx.font = '400 12px -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif';
       ctx.fillStyle = COL.faint;
       ctx.fillText('AI · ' + (view.botName || LEVEL_NAMES[view.botLevel] || '普通'),
-        W / 2 + 90, 112);
+        view.W / 2 + 90, 112);
       // coop：左边那半场是两个人合作守的，标一下，免得以为对面只有一个人
-      if (view.coop) ctx.fillText('2 人合作', W / 2 - 90, 112);
+      if (view.coop) ctx.fillText('2 人合作', view.W / 2 - 90, 112);
     }
 
     // 10 平之后把规则摆出来，免得人以为"怎么赢了还不结束"
@@ -2586,7 +2043,7 @@
         && Math.abs(s0 - s1) <= 1) {
       ctx.font = '400 14px -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif';
       ctx.fillStyle = COL.good;
-      ctx.fillText('追分中 · 需净胜 2 分', W / 2, 122);
+      ctx.fillText('追分中 · 需净胜 2 分', view.W / 2, 122);
     }
 
     // 隐形球的提示。★ 两个方向都必须写：
@@ -2599,10 +2056,10 @@
       ctx.font = '400 14px -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif';
       if (mt >= 0 && view.invis[mt] > 0) {
         ctx.fillStyle = '#fca5a5';
-        ctx.fillText('球被隐形 · 靠预判 ' + view.invis[mt].toFixed(1) + 's', W / 2, 146);
+        ctx.fillText('球被隐形 · 靠预判 ' + view.invis[mt].toFixed(1) + 's', view.W / 2, 146);
       } else if (ft >= 0 && view.invis[ft] > 0) {
         ctx.fillStyle = '#86efac';
-        ctx.fillText('对手看不见球 ' + view.invis[ft].toFixed(1) + 's', W / 2, 146);
+        ctx.fillText('对手看不见球 ' + view.invis[ft].toFixed(1) + 's', view.W / 2, 146);
       }
     }
 
@@ -2615,7 +2072,7 @@
         ctx.textAlign = 'center';
         ctx.textBaseline = 'middle';
         ctx.fillStyle = SKIN_COL[2];
-        ctx.fillText('幻影生效中 ' + view.phantom[mtp].toFixed(1) + 's', W / 2, 168);
+        ctx.fillText('幻影生效中 ' + view.phantom[mtp].toFixed(1) + 's', view.W / 2, 168);
       }
     }
 
@@ -2647,7 +2104,7 @@
     // 球拍：长度按服务端下发的倍率画，条数与位置按槽位表（经典 2 条，coop 3 条）。
     // ★ 必须跟着倍率走，否则吃到"加长"后会看着明明碰到了却没弹回来。
     var xL = PADDLE_MARGIN;
-    var xR = W - PADDLE_MARGIN - PADDLE_W;
+    var xR = view.W - PADDLE_MARGIN - PADDLE_W;
 
     // ★ 这里原来还会在"自己那块拍子"旁边（xL-5 / xR+PADDLE_W+5）画一条**平行白线**，
     //   用来标出哪条是自己的。但它和拍子中间隔着几像素背景，看着就是一根没人管的杂线，
@@ -2746,14 +2203,14 @@
       var secs = Math.ceil(view.countdownMs / 1000);
       ctx.font = '500 20px -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif';
       ctx.fillStyle = COL.text;
-      ctx.fillText(secs > 0 ? secs + '' : '开始', W / 2, H / 2 + 4);
+      ctx.fillText(secs > 0 ? secs + '' : '开始', view.W / 2, view.H / 2 + 4);
     }
 
     // 结束
     if (view.phase === 'over' && view.winner >= 0) {
       ctx.font = '500 26px -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif';
       ctx.fillStyle = COL.good;
-      ctx.fillText('本局结束', W / 2, H / 2 - 16);
+      ctx.fillText('本局结束', view.W / 2, view.H / 2 - 16);
       ctx.font = '400 15px -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif';
       ctx.fillStyle = COL.text;
       // ★ winner 是**队伍**号，mySide 是槽位号。coop 里左边两个座位同属 0 队，
@@ -2761,7 +2218,7 @@
       var winTxt = view.winner === teamOfMine()
         ? (view.coop ? '你们赢了' : '你赢了')
         : (view.solo ? 'AI 赢了' : '对手赢了');
-      ctx.fillText(winTxt + ' · ' + view.score[0] + ' : ' + view.score[1], W / 2, H / 2 + 16);
+      ctx.fillText(winTxt + ' · ' + view.score[0] + ' : ' + view.score[1], view.W / 2, view.H / 2 + 16);
     }
 
     // 缺人 / 暂停提示
@@ -2772,7 +2229,7 @@
       ctx.fillStyle = COL.faint;
       ctx.fillText(hasPeer
         ? '已暂停'
-        : (view.coop ? '等待队友加入…' : '等待对手加入…'), W / 2, H / 2 + 60);
+        : (view.coop ? '等待队友加入…' : '等待对手加入…'), view.W / 2, view.H / 2 + 60);
     }
 
     // 暂停（真人按的）。
@@ -2782,28 +2239,28 @@
     //   而不是"球不动了但界面毫无变化"（那样人只会以为自己卡了或者对面掉线了）。
     if (view.userPaused && view.mySide >= 0 && view.phase !== 'waiting') {
       ctx.fillStyle = 'rgba(9, 13, 24, 0.58)';
-      ctx.fillRect(0, 0, W, H);
+      ctx.fillRect(0, 0, view.W, view.H);
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
       ctx.font = '500 26px -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif';
       ctx.fillStyle = '#e8eefb';
-      ctx.fillText('已暂停', W / 2, H / 2 - 20);
+      ctx.fillText('已暂停', view.W / 2, view.H / 2 - 20);
       ctx.font = '400 14px -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif';
       ctx.fillStyle = COL.text;
-      ctx.fillText(pauseWhoText(), W / 2, H / 2 + 12);
-      ctx.fillText('任意一方点「继续」即可恢复', W / 2, H / 2 + 36);
+      ctx.fillText(pauseWhoText(), view.W / 2, view.H / 2 + 12);
+      ctx.fillText('任意一方点「继续」即可恢复', view.W / 2, view.H / 2 + 36);
     }
 
     // 断线时在画面上直说，别让人以为是自己的操作卡住了
     if (view.mySide >= 0 && !view.connected) {
       ctx.fillStyle = 'rgba(9, 13, 24, 0.74)';
-      ctx.fillRect(0, 0, W, H);
+      ctx.fillRect(0, 0, view.W, view.H);
       ctx.font = '500 20px -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif';
       ctx.fillStyle = '#ffb4a2';
-      ctx.fillText('连接断开，正在重连…', W / 2, H / 2);
+      ctx.fillText('连接断开，正在重连…', view.W / 2, view.H / 2);
       ctx.font = '400 14px -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif';
       ctx.fillStyle = COL.text;
-      ctx.fillText('重连后会自动坐回原位，比分不会丢', W / 2, H / 2 + 26);
+      ctx.fillText('重连后会自动坐回原位，比分不会丢', view.W / 2, view.H / 2 + 26);
     }
   }
 
@@ -2863,12 +2320,13 @@
     }
 
     // 触摸目标跟随
+    var touchTargetY = app.input.getTouchTargetY();
     if (touchTargetY !== null && view.mySide >= 0 && !frozen) {
       var td = touchTargetY - view.paddleDisp[view.mySide];
-      setDir(Math.abs(td) > 8 ? (td > 0 ? 1 : -1) : 0);
+      app.input.setDir(Math.abs(td) > 8 ? (td > 0 ? 1 : -1) : 0);
     }
 
-    bgmTick(dt);        // 用真实 dt；音量状态机不该被游戏的暂停冻住
+    app.audio.bgmTick(dt);   // 用真实 dt；音量状态机不该被游戏的暂停冻住
 
     fitCanvas();
     layoutSkillBtns();  // 技能按钮每帧跟着自己的拍子走（拍子一直在动）
@@ -2895,7 +2353,7 @@
     }
   })();
 
-  bgmInit();                  // 提前开始加载，等第一次点击就能直接响
+  app.audio.init();          // 提前开始加载，等第一次点击就能直接响
   fitCanvas();
   requestAnimationFrame(loop);
 
