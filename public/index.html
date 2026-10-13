@@ -770,7 +770,7 @@
     phantom: [0, 0],          // 各队幻影球还剩几秒（只给释放方看，给的是"还在生效"的反馈）
     // ---- 第 11 轮五种新技能的对外状态（全部由服务端下发，客户端只负责画） ----
     stickArmed: [],           // 各槽位"下一板会粘住球"是否已武装
-    stuckBall: 0,             // 正被粘住的球 [x, y, 槽位] 或 0（画的时候要硬贴在拍子上）
+    stuckBall: 0,             // 正被粘住的球 [球id, x, y, 槽位] 或 0（画的时候要硬贴在它那颗球上）
     holes: [],                // 黑洞 [[x, y, 剩余秒, 队伍], ...]
     chaos: [],                // 各槽位"乱弹"还剩几秒
     blockCharges: [],         // 各队还有几层道具封锁（对手那一格服务端会抹成 0）
@@ -2966,11 +2966,16 @@
         // ★ 被粘住的球要**硬贴**在服务端给的坐标上，不走平滑 ——
         //   粘住的球坐标跟着拍子每 tick 走，客户端那套指数平滑会慢它半帧，
         //   看着就是"球黏在拍子旁边飘"，不像粘住。
-        //   sk2 是 [x, y, 槽位]，同一时刻**最多只有一颗**球被粘住（一次粘一板），
-        //   所以这里不需要按 id 匹配：场上只要有一颗粘住的球就是它。
-        var stuckHere = view.stuckBall && view.stuckBall.length === 3 ? view.stuckBall : 0;
-        var bx = stuckHere ? stuckHere[0] : bd.x;
-        var by = stuckHere ? stuckHere[1] : bd.y;
+        // ★★ 必须**按球 id 匹配**（2026-10-11 修）：sk2 是 [球id, x, y, 槽位]。
+        //   原来是"场上只要有一颗粘住的球就是它"、无条件套给每一颗球 ——
+        //   多球（分裂球 / 幻影球）时，被粘住的那颗会把其余几颗"吸"到自己身上，
+        //   看起来就是"一个球被粘住，其它球全消失了"。
+        var stuckHere = 0;
+        if (view.stuckBall && view.stuckBall.length === 4 && view.stuckBall[0] === ball.id) {
+          stuckHere = view.stuckBall;
+        }
+        var bx = stuckHere ? stuckHere[1] : bd.x;
+        var by = stuckHere ? stuckHere[2] : bd.y;
         // 弧线球生效时画一串渐隐的尾迹 —— 不画的话玩家只会觉得"球有点飘"，
         // 完全看不出是被道具影响了，也不知道往哪边飘
         var tail = view.tails[ball.id] || [];

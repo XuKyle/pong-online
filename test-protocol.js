@@ -570,6 +570,29 @@ async function main() {
   check('★ 幻影进冷却，长度 = 15 秒', G.latest().sc[1] > 14 && G.latest().sc[1] <= 15,
     `sc[1]=${G.latest().sc[1]}`);
 
+  // ---- ★ 9e-2. 蓝粘球在多球场上必须**指名道姓**（2026-10-11 修的 bug） ----
+  // 玩家报的 bug："一个球被粘住的时候其它球会消失"。
+  // 根因是 sk2 只下发 [x, y, 槽位]、不带球 id，客户端于是把硬贴坐标**无条件套给
+  // 每一颗球**（它的旧前提是"场上最多只有一颗球被粘住"）。多球时被粘住的那颗
+  // 会把其余几颗"吸"到自己身上 —— 看起来就是其它球消失了。
+  // ⇒ 契约：sk2 非 0 时必须是 **[球id, x, y, 槽位]** 四元组，且球 id 指向真球。
+  {
+    // 上面那一段幻影刚好造出了"多球"局面，这里趁着幻影还在先验形状；
+    // 幻影可能已经过期，所以形状断言只对**此刻真的有粘住球**时成立才判。
+    const st = G.latest();
+    const sk2Ok = st.sk2 === 0
+      || (Array.isArray(st.sk2) && st.sk2.length === 4
+        && Number.isInteger(st.sk2[0])
+        && st.sk2.every((v) => typeof v === 'number'));
+    check('★ sk2（粘住的球）非 0 时是 [球id, x, y, 槽位] 四元组，且带球 id',
+      sk2Ok, `sk2=${JSON.stringify(st.sk2)}`);
+    if (st.sk2 !== 0) {
+      check('★ sk2 里的球 id 确实指向场上真实存在的球（不是凭空编的编号）',
+        (st.bs || []).some((b) => b[0] === st.sk2[0]),
+        `sk2[0]=${st.sk2[0]} 场上 id=${JSON.stringify((st.bs || []).map((b) => b[0]))}`);
+    }
+  }
+
   // ---- 9f. 红色：超高速（蓄力）+ 灰板子按了白按 ----
   const P = makeClient('P');            // 红色
   const Q = makeClient('Q');            // 故意发个非法编号 99，验服务端归一化成灰

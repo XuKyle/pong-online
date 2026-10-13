@@ -340,6 +340,10 @@ const DEBUG_FX = process.env.PONG_DEBUG_FX === '1';
 // 调试开关：让球一直带弧线，好把"拐弯的尾迹"定格截图。
 // 弧线球得靠球随机撞上道具才生效，靠等就是碰运气 —— 和 DEBUG_FX 一个道理。
 const DEBUG_CURVE = process.env.PONG_DEBUG_CURVE === '1';
+// 调试开关：发球时立刻造出"一颗球被粘住 + 另一颗球在飞"的多球局面，
+// 好让前端探针取证"粘球不能让其它球消失"这件事。靠真人接到粘球、且场上
+// 恰好还有别的球（分裂球/幻影球）是碰运气，测不出稳定结论。默认关闭。
+const DEBUG_STICK_MULTI = process.env.PONG_DEBUG_STICK_MULTI === '1';
 // 强制类型那个开关同时也是"快进开关"：它的用途就是"把六种道具一一定格截图"。
 // ★ 实测正常节奏下一轮要 19.5 秒（存活 13s + 间隔 6.5s，没人吃的话），
 //   要轮到第六种得等 100 秒以上。所以在这个开关下把节奏压紧。
@@ -1140,6 +1144,26 @@ function launchBall(room) {
   const servingTeam = 1 - room.serveTo;
   room.lastHitter = room.slots.findIndex((s) => s.team === servingTeam);
   room.phase = 'playing';
+  // ★ 调试：造出"一颗粘住 + 一颗在飞"的多球局面（默认关闭，线上走不到）。
+  //   0 号球挂在左拍上，另外生成一颗向右飞的真球 —— 正是玩家报的那个场景。
+  if (DEBUG_STICK_MULTI) {
+    const stickSlot = room.slots.findIndex((s) => s.edge === 'left');
+    if (stickSlot >= 0) {
+      b.stuck = {
+        slot: stickSlot,
+        until: room.serverTime + STICK_MS,
+        ox: PADDLE_W / 2 + BALL_R + 1,
+        oy: 0,
+      };
+      b.vx = 0;
+      b.vy = 0;
+      // 第二颗：往右飞，和粘住的那颗同时存在
+      const b2 = makeBall(room.W * 0.35, room.H * 0.35);
+      b2.vx = 380;
+      b2.vy = 140;
+      room.balls.push(b2);
+    }
+  }
 }
 
 function startMatch(room) {
@@ -1995,13 +2019,17 @@ function broadcastState(room) {
     // 蓝：哪几个槽位已经武装了"粘球"（1 = 下一次击球会把球粘住）。**公开**——
     //   对手看得见"对面举着粘球"，才有反应空间；这跟幻影球的私有字段不是一回事。
     sa: room.stickArmed.map((v) => (v ? 1 : 0)),
-    // 蓝：正在被粘住的球（[x, y] 或 0）。客户端据此把球画在拍子上 ——
+    // 蓝：正在被粘住的球（[球id, x, y, 槽位] 或 0）。客户端据此把球画在拍子上 ——
     //   ★ 必须**单独下发**，不能只靠 bs 里的坐标：粘住的球坐标由服务端每 tick
     //   跟着拍子算，客户端平滑一下就会"飘"在拍子旁边，看起来没粘住。
     //   下发这个标记让客户端把它**硬贴**在拍子上（绕过平滑）。
+    //   ★★ 球 id 必须带上（2026-10-11 修）：场上可能有多颗球（分裂球/幻影球），
+    //   客户端原先靠"同一时刻最多只有一颗球被粘住"这个前提，把硬贴坐标无条件
+    //   套在**每一颗**球上 —— 结果一颗被粘住时，其余几颗全被画到它身上（看起来
+    //   就是"其它球消失了"）。带上 id，客户端只对匹配的那颗硬贴。
     sk2: (() => {
       const s = room.balls.find((b) => b.stuck);
-      return s ? [r1(s.x), r1(s.y), s.stuck.slot] : 0;
+      return s ? [s.id, r1(s.x), r1(s.y), s.stuck.slot] : 0;
     })(),
     // 黑：场上所有黑洞 [[x, y, 剩余秒, 开洞方队伍], ...]（可以同时有多个）
     hh: room.holes.map((h) => [r1(h.x), r1(h.y), Math.max(0, r2((h.until - room.serverTime) / 1000)), h.team]),
