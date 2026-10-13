@@ -273,6 +273,32 @@
       tkWinStart: 0,      // 频率统计窗口的起点时刻
       tkWinBase: 0        // 窗口起点处的 tick 值
       };
+  /** 我属于哪一队。view.mySide 是**槽位**号；coop 里左边两个槽位同属 0 队 */
+  function teamOfMine() {
+    var sl = view.slots[view.mySide];
+    return sl ? sl.team : -1;
+  }
+
+  /**
+   * 我这一侧**看到的球**有多不透明（1 = 完全看得见，0 = 完全看不见）。
+   *
+   * 隐形球是"吃到的人看得见、对面看不见"。透明度曲线由服务端算好下发
+   * （见服务端 invisAlpha），这里只把"我属于哪一队"映射到那个数组上 ——
+   * 渐变只有一份实现，两边不可能各算各的然后悄悄错位。
+   *
+   * ★ 这是**客户端**过滤，不是"服务端不给你发坐标"：快照里的球位置双方都收得到。
+   *   所以严格说，改了客户端的人能作弊看见球。这是个休闲双人游戏，
+   *   对手本来就能扭头看你的屏幕，为此把每个座位的快照拆开发并不值当。
+   *   对不作弊的玩家，"看不见"就是真的看不见，与服务端权威的判定也完全一致
+   *   （球打到拍子上的判定从来只在服务端做）。
+   */
+  function ballVis() {
+    var t = teamOfMine();
+    if (t < 0) return 1;                        // 没入座（还在菜单里）不隐藏
+    var a = view.invisAlpha[t];
+    return typeof a === 'number' ? a : 1;
+  }
+
     // 只读表挂上去，让各模块用 app.COL / app.SKIN_COL 取，不用再各自定义一份。
     var app = {
       dom: dom,
@@ -300,6 +326,10 @@
       WIN_SCORE: WIN_SCORE,
       WIN_MARGIN: WIN_MARGIN,
       slotsFor: slotsFor,
+      // 两个"我这一侧"的纯查询：渲染画谁的颜色、探针报什么、以及失分取证
+      // 都要用它们，所以放最底，谁都能读，也谁都只有一份实现。
+      teamOfMine: teamOfMine,
+      ballVis: ballVis,
       WIND_MS: WIND_MS,
       HOLE_R: HOLE_R,
       HOLE_LIFE_MS: HOLE_LIFE_MS

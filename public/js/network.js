@@ -394,7 +394,7 @@
    */
   function attach(app) {
     appCtx = app;
-    view = appCtx.view;
+    view = app.view;
     readInviteCode();
 
     var api = {
@@ -409,7 +409,7 @@
       // 退出房间时把"从链接带进来的码"也一起忘掉，否则下次重连还会自动往那儿冲
       forgetPendingCode: function () { pendingCode = null; }
     };
-    appCtx.net = api;
+    app.net = api;
     return api;
   }
 
