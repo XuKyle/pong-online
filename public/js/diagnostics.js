@@ -1,13 +1,20 @@
 /**
  * 取证与量表：把"这一局打下来客户端看到的和��务端的差多少"记下来。
  *
- * 这一层**不参与玩法**，一行都不改。它只做两件事：
+ * 这一层**不参与玩法**，一行都不改。它只做三件事：
  *   · recordMatchFrame 每帧记一帧（球、拍子、时钟），一局满了就报上去；
+ *   · noteSnapshot 每收到一次状态就看一眼比分：**我方丢分的那一瞬间**，
+ *     立刻把"画面上画出来的球和拍子位置"打进浏览器控制台；
  *   · renderMeters 把往返时延、快照频率、丢帧数刷到页面上的量表里。
  *
  * 服务端在每局结束时下发 mr（失分取证），这里拿它和本地的帧序列做比对，
  * 用来回答"球为什么看着穿过了拍子"这类问题 —— 那需要客户端**真的记帧**，
  * 光看代码或截图都验不了。
+ *
+ * 两种输出分工：
+ *   · 丢分**当时**（noteSnapshot）：第一现场，"我看到的位置"，立刻可抄去对比；
+ *   · 一局**打完**（emitMatchReport）：把服务端判定和本地帧逐条对齐，
+ *     给出"判漏了 / 画面可接 / 一致"的结论。
  */
 
 (function (global) {
@@ -139,6 +146,31 @@
   function emitMatchReport(message) {
     if (!message.mi || !Array.isArray(message.mr) || view.reportedMatchId === message.mi) return;
     view.reportedMatchId = message.mi;
+
+    // ---------- 得分报告：谁赢了哪一分 ----------
+    // mr 的每条就是一次失分 = 一分，且按得分先后排列，所以"逐分明细"直接读它：
+    // 第 i 分的赢家 = mr[i-1].scorer。先给这张表（谁赢了哪一分、当时比分、
+    // tick、服务端拍子最近余量），再给下面那份逐条对齐的详细对照。
+    var myTeam = appCtx.teamOfMine();
+    var teamLabel = function (team) {
+      return team === myTeam ? '我方' : (view.solo ? (view.botName || 'AI') : '对方');
+    };
+    var score = [0, 0];
+    var perPoint = message.mr.map(function (ms, i) {
+      score[ms.scorer] += 1;
+      var closest = ms.approach && ms.approach.closest;
+      return {
+        第几分: i + 1,
+        赢家: teamLabel(ms.scorer),
+        当时比分: score[0] + ':' + score[1],
+        tick: ms.tick,
+        服务端拍子余量px: closest ? closest.catchMargin : null
+      };
+    });
+    console.log('[Pong 本局得分报告] ' + message.mi + ' · 最终 ' + message.s.join(':')
+      + ' · 获胜方: ' + teamLabel(message.wn));
+    console.table(perPoint);
+
     var comparisons = message.mr.map(compareMissWithClientFrame);
     var serverSuspects = comparisons.filter(function (c) {
       return c.verdict.indexOf('服务端判定疑似异常') === 0;
@@ -162,6 +194,7 @@
       winnerTeam: message.wn,
       localTeam: appCtx.teamOfMine(),
       serverMissCount: message.mr.length,
+      perPoint: perPoint,
       clientFramesCaptured: view.matchFrames.length,
       clientFrameLimitReached: view.matchFrameNo > view.matchFrameLimit,
       serverClockOffsetMs: view.serverClockSynced ? Math.round(view.serverClockOffset) : null,
@@ -175,6 +208,97 @@
       points: comparisons
     });
     console.groupEnd();
+  }
+
+  // ---------- 丢分取证：我方丢分的**那一刻**，把画面上画出来的位置打进控制台 ----------
+  // 用法：球穿板的时候，丢分那一瞬间控制台会多一条橙色 [Pong 丢分取证]，
+  // 里面是"你看到的"球和拍子位置（rendered），同时附上同一刻的服务端真值（server）。
+  //   · renderedCatchMargin < 0 ⇒ 画面上球就在拍子能接的范围内，服务端却判了丢分
+  //     ⇒ 拿 rttMs / snapshotAgeMs 判断是不是网速把服务端拍子拖慢了（疑似判定错位）；
+  //   · renderedCatchMargin ≥ 0 ⇒ 画面上拍子也不在球的位置 ⇒ 真是够不着，服务端没错。
+  // 逐条对齐服务端的详细结论仍在一局打完后的 emitMatchReport 里，这里只是第一现场。
+  var lastScore = null;
+  var prevBallIds = null;
+
+  function noteSnapshot(m) {
+    if (!Array.isArray(m.s) || view.mySide < 0) return;
+    var newIds = [];
+    for (var i = 0; i < (m.bs || []).length; i += 1) newIds.push(m.bs[i][0]);
+    var gone = [];
+    if (prevBallIds) {
+      for (var g = 0; g < prevBallIds.length; g += 1) {
+        if (newIds.indexOf(prevBallIds[g]) < 0) gone.push(prevBallIds[g]);
+      }
+    }
+    prevBallIds = newIds;
+
+    var conceded = false;
+    if (lastScore) {
+      // 比分回落后说明是新一局（比分重置），不算丢分
+      var fresh = m.s[0] < lastScore[0] || m.s[1] < lastScore[1];
+      conceded = !fresh && m.s[1 - appCtx.teamOfMine()] > lastScore[1 - appCtx.teamOfMine()];
+    }
+    lastScore = m.s.slice();
+    if (!conceded) return;
+    dumpConceded(gone);
+  }
+
+  function dumpConceded(goneIds) {
+    var myTeam = appCtx.teamOfMine();
+    // 找"刚消失的那颗球"（出界被移除的）在本地帧序列里的最后一帧 ——
+    // 那就是"丢分前一刻我看到的画面"。帧是 recordMatchFrame 每帧记的，
+    // 球的位置分"画出来的 rendered"和"服务端真值 server"两份。
+    var last = null;
+    for (var f = view.matchFrames.length - 1; f >= 0; f -= 1) {
+      var frame = view.matchFrames[f];
+      for (var b = 0; b < frame.balls.length; b += 1) {
+        if (goneIds.indexOf(frame.balls[b].id) >= 0) {
+          last = { frame: frame, ball: frame.balls[b] };
+          break;
+        }
+      }
+      if (last) break;
+    }
+    if (!last) {
+      console.warn('[Pong 丢分取证] 比分 ' + lastScore.join(':') + '，我方丢分，但没找到丢分前的本地帧');
+      return;
+    }
+    var fr = last.frame, ball = last.ball;
+    // 我方这边所有拍子（coop 是同一侧两个槽位），取画面上离球最近的那块
+    var paddle = null, margin = Infinity;
+    for (var p = 0; p < fr.paddles.length; p += 1) {
+      var pd = fr.paddles[p];
+      if (pd.team !== myTeam) continue;
+      var mg = Math.abs(ball.rendered[1] - pd.renderedY) - pd.catchHalfHeight;
+      if (mg < margin) { margin = mg; paddle = pd; }
+    }
+    if (!paddle) {
+      console.warn('[Pong 丢分取证] 比分 ' + lastScore.join(':') + '，我方丢分，但帧里没有我方拍子');
+      return;
+    }
+    var verdict = margin < 0
+      ? '画面上球就在拍子能接的范围内，服务端却判了丢分 —— 疑似网速把服务端拍子拖慢造成判定错位，'
+        + '结合 RTT（' + fr.rttMs + 'ms）/ 快照年龄（' + (fr.snapshotAgeMs === null ? '?' : fr.snapshotAgeMs + 'ms') + '）判断'
+      : '画面上拍子也不在球的位置（差 ' + margin.toFixed(1) + 'px）—— 真是够不着，服务端判定没错';
+    console.warn('[Pong 丢分取证] 比分 ' + lastScore.join(':') + '，我方丢分（tick ' + fr.serverTick
+      + '，RTT ' + fr.rttMs + 'ms）：' + verdict);
+    console.log({
+      比分: lastScore,
+      serverTick: fr.serverTick,
+      rttMs: fr.rttMs,
+      快照年龄ms: fr.snapshotAgeMs,
+      球_画面上: ball.rendered,      // [x, y] 我眼睛看到的球
+      球_服务端真值: ball.server,      // [x, y] 同一刻服务端认为的球
+      球_画面滞后: [
+        Math.round((ball.rendered[0] - ball.server[0]) * 10) / 10,
+        Math.round((ball.rendered[1] - ball.server[1]) * 10) / 10
+      ],
+      我的拍子_画面上Y: paddle.renderedY,
+      我的拍子_服务端Y: paddle.serverY,
+      接球半高: paddle.catchHalfHeight,     // |球Y - 拍Y| ≤ 这个值才算接得住
+      画面接球余量px: Math.round(margin * 10) / 10,   // < 0 = 画面上球在拍子范围内
+      结论: verdict
+    });
   }
 
   // 手机端顶部的延迟胶囊（句柄在上面的 dom 别名里）。桌面端它是 display:none，
@@ -265,6 +389,7 @@
 
     var api = {
       recordMatchFrame: recordMatchFrame,
+      noteSnapshot: noteSnapshot,
       renderMeters: renderMeters,
       emitMatchReport: emitMatchReport
     };

@@ -245,6 +245,7 @@
       score: [0, 0],
       present: [0, 0],
       winner: -1,
+      pointWinners: [],       // 每分的赢家（队伍号），按得分先后；局终画布上画逐分明细用
       serverTick: 0,
       countdownMs: 0,
 

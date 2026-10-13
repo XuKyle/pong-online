@@ -224,6 +224,7 @@
         view.matchFrames = [];
         view.matchFrameNo = 0;
         view.reportedMatchId = '';
+        view.pointWinners = [];
         // 刚坐下一定是"还没开打"：把上一次对局残留的阶段与暂停状态清掉，
         // 否则从一局里退出来再进新房时，那一瞬间按钮会按旧阶段的判断显示出来。
         view.phase = 'waiting';
@@ -280,8 +281,16 @@
         appCtx.render.applyBallSnapshot(m.bs);
         view.paddles = m.p.slice();
         view.score = m.s;
+        // 丢分取证：我方丢分的那一瞬立刻往控制台打"画面上画出来的"球/拍子位置
+        // （diagnostics.noteSnapshot 内部自己判"是不是我方丢分"，平时是空操作）
+        appCtx.diag.noteSnapshot(m);
         view.present = m.pr;
         view.winner = m.wn;
+        // 逐分赢家：mr 按得分先后排列，每条的 scorer 就是赢走那一分的队伍。
+        // 只在 over 时写 —— 新一局开始时服务端清 missLog，这里就等下一份新的。
+        if (m.ph === 'over' && Array.isArray(m.mr)) {
+          view.pointWinners = m.mr.map(function (x) { return x.scorer; });
+        }
         view.countdownMs = m.cd || 0;
         view.powerups = m.us || [];
         view.curve = m.cv || 0;
