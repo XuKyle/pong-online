@@ -37,6 +37,7 @@ function createPhysics(deps) {
     CHAOS_HALF_DEG,
     HOLE_R,
     HOLE_HALF_DEG,
+    DEBUG_STICK_MULTI = false,
     clamp,
     isPhantom,
     paddleHalf,
@@ -141,6 +142,27 @@ function createPhysics(deps) {
     const servingTeam = 1 - room.serveTo;
     room.lastHitter = room.slots.findIndex((s) => s.team === servingTeam);
     room.phase = 'playing';
+
+    // Debug fixture: create the reported multi-ball sticky-ball state on demand.
+    // Disabled by default so production match behavior is unchanged.
+    if (DEBUG_STICK_MULTI) {
+      const stickSlot = room.slots.findIndex((slot) => slot.edge === 'left');
+      if (stickSlot >= 0) {
+        b.stuck = {
+          slot: stickSlot,
+          until: room.serverTime + STICK_MS,
+          ox: PADDLE_W / 2 + BALL_R + 1,
+          oy: 0,
+        };
+        b.vx = 0;
+        b.vy = 0;
+
+        const secondBall = makeBall(room.W * 0.35, room.H * 0.35);
+        secondBall.vx = 380;
+        secondBall.vy = 140;
+        room.balls.push(secondBall);
+      }
+    }
   }
 
   /**

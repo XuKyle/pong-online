@@ -570,6 +570,23 @@ async function main() {
   check('★ 幻影进冷却，长度 = 15 秒', G.latest().sc[1] > 14 && G.latest().sc[1] <= 15,
     `sc[1]=${G.latest().sc[1]}`);
 
+  // ---- ★ 9e-2. 蓝粘球在多球场上必须按球 ID 识别（2026-10-11 修复） ----
+  // sk2 非 0 时必须提供 [球id, x, y, 槽位]，且 id 应属于当前快照中的球。
+  {
+    const state = G.latest();
+    const sk2Ok = state.sk2 === 0
+      || (Array.isArray(state.sk2) && state.sk2.length === 4
+        && Number.isInteger(state.sk2[0])
+        && state.sk2.every((value) => typeof value === 'number'));
+    check('★ sk2 非 0 时是带球 ID 的四元组 [球id, x, y, 槽位]', sk2Ok,
+      `sk2=${JSON.stringify(state.sk2)}`);
+    if (state.sk2 !== 0) {
+      check('★ sk2 球 ID 指向当前快照中的球',
+        (state.bs || []).some((ball) => ball[0] === state.sk2[0]),
+        `sk2[0]=${state.sk2[0]} 球 IDs=${JSON.stringify((state.bs || []).map((ball) => ball[0]))}`);
+    }
+  }
+
   // ---- 9f. 红色：超高速（蓄力）+ 灰板子按了白按 ----
   const P = makeClient('P');            // 红色
   const Q = makeClient('Q');            // 故意发个非法编号 99，验服务端归一化成灰

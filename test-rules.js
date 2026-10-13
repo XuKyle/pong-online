@@ -1699,6 +1699,43 @@ console.log('21) 第 11 轮：蓝粘球 / 黑黑洞 / 紫乱弹 / 白封锁 / �
     eq('★ 而且一点竖直分量都没有（"正前方"）', Math.round(b.vy), 0);
   }
 
+  // ---- 21.2b sk2 粘球快照契约 ----
+  // 多球场景必须用球 id 指定唯一被粘住的球，否则客户端会把它们叠画在同一坐标。
+  {
+    const r = live();
+    r.phase = 'playing';
+    const stuck = r.balls[0];
+    stuck.x = 72.25;
+    stuck.y = 201.75;
+    stuck.stuck = { slot: 0, until: T + S.STICK_MS, ox: 15, oy: 0 };
+    const moving = S.makeBall(300, 170);
+    moving.vx = 380;
+    moving.vy = 140;
+    r.balls.push(moving);
+
+    const packets = [];
+    for (let slot = 0; slot < r.N; slot += 1) {
+      r.players[slot] = {
+        ws: { readyState: 1, send: (raw) => packets.push(JSON.parse(raw)) },
+        token: `sk2-${slot}`, dir: 0, since: T,
+      };
+    }
+    S.broadcastState(r);
+    const snapshot = packets[0];
+    check('★ 粘球 sk2 使用 [球id, x, y, 槽位] 四字段契约',
+      Array.isArray(snapshot.sk2) && snapshot.sk2.length === 4,
+      JSON.stringify(snapshot.sk2));
+    eq('★ sk2 的球 id 对应唯一被粘住的球', snapshot.sk2[0], stuck.id);
+    check('★ sk2 的球 id 确实存在于多球快照 bs',
+      snapshot.bs.some((entry) => entry[0] === snapshot.sk2[0]),
+      `sk2=${snapshot.sk2[0]} bs=${JSON.stringify(snapshot.bs)}`);
+    check('★ sk2 坐标按协议精度对应被粘住球',
+      snapshot.sk2[1] === 72.3 && snapshot.sk2[2] === 201.8,
+      JSON.stringify(snapshot.sk2));
+    eq('★ sk2 保留粘住球的拍子槽位', snapshot.sk2[3], 0);
+    eq('前置：快照中仍有另一颗独立移动球', snapshot.bs.length, 2);
+  }
+
   // ---- 21.3 黑：黑洞 ----
   // 需求：己方**靠近中间**的半区开洞（左：x ∈ [W/4, W/2]），
   //       球从对面**靠近中间**的半区飞出（左开 → 出在 x ∈ [W/2, 3W/4]），

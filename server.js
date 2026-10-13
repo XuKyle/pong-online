@@ -347,6 +347,9 @@ const DEBUG_FX = process.env.PONG_DEBUG_FX === '1';
 // 调试开关：让球一直带弧线，好把"拐弯的尾迹"定格截图。
 // 弧线球得靠球随机撞上道具才生效，靠等就是碰运气 —— 和 DEBUG_FX 一个道理。
 const DEBUG_CURVE = process.env.PONG_DEBUG_CURVE === '1';
+// 调试开关：发球时生成一颗粘住球和一颗移动球，供多球粘球渲染探针稳定取证。
+// 默认关闭，不影响正常对局。
+const DEBUG_STICK_MULTI = process.env.PONG_DEBUG_STICK_MULTI === '1';
 // 强制类型那个开关同时也是"快进开关"：它的用途就是"把六种道具一一定格截图"。
 // ★ 实测正常节奏下一轮要 19.5 秒（存活 13s + 间隔 6.5s，没人吃的话），
 //   要轮到第六种得等 100 秒以上。所以在这个开关下把节奏压紧。
@@ -792,6 +795,7 @@ const physics = createPhysics({
   HOLE_R,
   HOLE_HALF_DEG,
   COUNTDOWN_MS,
+  DEBUG_STICK_MULTI,
   clamp,
   isPhantom,
   paddleHalf,
@@ -1191,13 +1195,11 @@ function broadcastState(room) {
     // 蓝：哪几个槽位已经武装了"粘球"（1 = 下一次击球会把球粘住）。**公开**——
     //   对手看得见"对面举着粘球"，才有反应空间；这跟幻影球的私有字段不是一回事。
     sa: room.stickArmed.map((v) => (v ? 1 : 0)),
-    // 蓝：正在被粘住的球（[x, y] 或 0）。客户端据此把球画在拍子上 ——
-    //   ★ 必须**单独下发**，不能只靠 bs 里的坐标：粘住的球坐标由服务端每 tick
-    //   跟着拍子算，客户端平滑一下就会"飘"在拍子旁边，看起来没粘住。
-    //   下发这个标记让客户端把它**硬贴**在拍子上（绕过平滑）。
+    // 蓝：被粘住球的身份与服务端位置（[球id, x, y, 槽位] 或 0）。
+    //   多球时客户端只将对应 id 的球硬贴到拍子上，避免其它球被画到同一位置。
     sk2: (() => {
-      const s = room.balls.find((b) => b.stuck);
-      return s ? [r1(s.x), r1(s.y), s.stuck.slot] : 0;
+      const ball = room.balls.find((candidate) => candidate.stuck);
+      return ball ? [ball.id, r1(ball.x), r1(ball.y), ball.stuck.slot] : 0;
     })(),
     // 黑：场上所有黑洞 [[x, y, 剩余秒, 开洞方队伍], ...]（可以同时有多个）
     hh: room.holes.map((h) => [r1(h.x), r1(h.y), Math.max(0, r2((h.until - room.serverTime) / 1000)), h.team]),

@@ -569,14 +569,12 @@
         var bd = view.ballDisps[ball.id];
         if (!bd) continue;
         if (vis <= 0.004) continue;              // 看不见就是看不见，什么都不画
-        // ★ 被粘住的球要**硬贴**在服务端给的坐标上，不走平滑 ——
-        //   粘住的球坐标跟着拍子每 tick 走，客户端那套指数平滑会慢它半帧，
-        //   看着就是"球黏在拍子旁边飘"，不像粘住。
-        //   sk2 是 [x, y, 槽位]，同一时刻**最多只有一颗**球被粘住（一次粘一板），
-        //   所以这里不需要按 id 匹配：场上只要有一颗粘住的球就是它。
-        var stuckHere = view.stuckBall && view.stuckBall.length === 3 ? view.stuckBall : 0;
-        var bx = stuckHere ? stuckHere[0] : bd.x;
-        var by = stuckHere ? stuckHere[1] : bd.y;
+        // ★ sk2 是 [球id, x, y, 槽位]。多球时只对 id 匹配的球取消平滑；
+        //   不能把被粘球的位置套给其它球，否则它们会叠到一起，看起来像消失了。
+        var stuckHere = view.stuckBall && view.stuckBall.length === 4
+          && view.stuckBall[0] === ball.id ? view.stuckBall : 0;
+        var bx = stuckHere ? stuckHere[1] : bd.x;
+        var by = stuckHere ? stuckHere[2] : bd.y;
         // 弧线球生效时画一串渐隐的尾迹 —— 不画的话玩家只会觉得"球有点飘"，
         // 完全看不出是被道具影响了，也不知道往哪边飘
         var tail = view.tails[ball.id] || [];
