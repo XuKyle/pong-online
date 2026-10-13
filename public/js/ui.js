@@ -659,6 +659,75 @@
     overlay.classList.add('hidden');
   }
 
+  // ---------- 局终结算弹出框 ----------
+  // 一局打完，用覆盖层弹出**逐分明细**（哪一分归谁），替代画布上那几行字。
+  // 数据：view.pointWinners 由 network.js 从服务端 mr 取（scorer 序列），
+  //       比分 / 胜方在 view.score / view.winner。
+  // ★ 每局只弹一次：view.matchId 每局都换（服务端 matchNo 自增），拿它当键。
+  // ★ over 阶段"人齐了就撤覆盖层"的自动清理会跳过（network.js 里），
+  //   所以下一局倒计时开始时才由那条逻辑把弹框收掉。
+  var settlementShownFor = '';
+  function showSettlement() {
+    if (view.phase !== 'over' || view.winner < 0) return;
+    if (!view.matchId || settlementShownFor === view.matchId) return;
+    var pw = view.pointWinners;
+    if (!pw || !pw.length) return;
+    settlementShownFor = view.matchId;
+
+    var myT = appCtx.teamOfMine();
+    var label = function (team) {
+      return team === myT
+        ? (view.coop ? '我方' : '我')
+        : (view.solo ? (view.botName || 'AI') : '对手');
+    };
+
+    overlayBody.innerHTML = '';
+    var h = document.createElement('h2');
+    h.textContent = '本局结束';
+    var p = document.createElement('p');
+    p.textContent = (view.winner === myT
+      ? (view.coop ? '你们赢了' : '你赢了')
+      : (view.solo ? 'AI 赢了' : '对手赢了'))
+      + ' · ' + view.score[0] + ' : ' + view.score[1];
+
+    // 逐分表：第一列行标签，后面每分一列。
+    // 谁赢的那一分，谁那一行对应列打 ✓（绿色），另一边给个浅色点。
+    var table = document.createElement('div');
+    table.className = 'settle';
+    table.style.gridTemplateColumns = '44px repeat(' + pw.length + ', 22px)';
+    function row(tag, team) {
+      var t = document.createElement('span');
+      t.className = 'lbl' + (team !== null && team === view.winner ? ' win' : '');
+      t.textContent = tag;
+      table.appendChild(t);
+      for (var i = 0; i < pw.length; i += 1) {
+        var c = document.createElement('span');
+        if (team === null) { c.className = 'num'; c.textContent = i + 1; }
+        else {
+          c.className = pw[i] === team ? 'hit' : 'miss';
+          c.textContent = pw[i] === team ? '✓' : '·';
+        }
+        table.appendChild(c);
+      }
+    }
+    row('', null);
+    row(label(0), 0);
+    row(label(1), 1);
+
+    var hint = document.createElement('p');
+    hint.className = 'hint';
+    hint.textContent = '下一局马上开始…';
+
+    var wrap = document.createElement('div');
+    wrap.className = 'settle-wrap';
+    wrap.appendChild(table);
+    overlayBody.appendChild(h);
+    overlayBody.appendChild(p);
+    overlayBody.appendChild(wrap);
+    overlayBody.appendChild(hint);
+    overlay.classList.remove('hidden');
+  }
+
   // 局间重选拍子。需求："无论什么模式，每结束一局都要可以重新选拍子"。
   // ★ 触发源是服务端下发的 rsel（不是客户端自己拿 phase 猜）：
   //   窗口什么时候开（真的翻了新一局）与什么时候关（球真的发出去了）都是服务端的事实，
@@ -750,6 +819,7 @@
       showMenu: showMenu,
       showWaiting: showWaiting,
       showDisconnected: showDisconnected,
+      showSettlement: showSettlement,
       hideOverlay: hideOverlay,
       setBadge: setBadge,
       syncPauseBtn: syncPauseBtn,

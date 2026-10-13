@@ -326,6 +326,7 @@
         appCtx.ui.syncReselect(view.canReselect);
         appCtx.ui.syncSkillBtns();
         if (m.ph === 'over' && m.mr) appCtx.diag.emitMatchReport(m);
+        if (m.ph === 'over') appCtx.ui.showSettlement();
 
         // 事件是"这一批快照里发生的事"，服务端发完即清。
         // 主循环一轮可能推进多个 tick 才广播一次，所以这里可能一次收到多个事件。
@@ -361,9 +362,11 @@
         }
 
         // 所有座位都在场就把覆盖层撤掉，把场地让出来。
+        // ★ over 阶段例外：那 4 秒里弹着局终结算（逐分明细），不能撤；
+        //   等下一局倒计时开始（phase 变了）再由这条逻辑收掉。
         // ★ coop 有三个座位（两个真人 + AI），要三个都到齐才算"人齐了" ——
         //   写成 present[0] && present[1] 会让第二个真人还没进来时就开局。
-        if (view.mySide >= 0 && view.present.length === view.slots.length
+        if (m.ph !== 'over' && view.mySide >= 0 && view.present.length === view.slots.length
             && view.present.every(function (v) { return v === 1; })) {
           if (!overlay.classList.contains('hidden')) appCtx.ui.hideOverlay();
         }

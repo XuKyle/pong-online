@@ -637,47 +637,6 @@
         ? (view.coop ? '你们赢了' : '你赢了')
         : (view.solo ? 'AI 赢了' : '对手赢了');
       ctx.fillText(winTxt + ' · ' + view.score[0] + ' : ' + view.score[1], view.W / 2, view.H / 2 + 16);
-
-      // 逐分明细：哪一分归谁。数据是 pointWinners（mr 的 scorer 序列，见 network.js）。
-      // 形式：
-      //        1   2   3   4   5
-      //   我    ✓        ✓         ✓
-      //   AI       ✓   ✓
-      var pw = view.pointWinners;
-      if (pw && pw.length) {
-        var nPts = pw.length;
-        var cell = Math.min(26, (view.W - 80) / (nPts + 1));   // +1 列留给左边的行标签
-        var x0 = view.W / 2 - (cell * (nPts + 1)) / 2;
-        var yNum = view.H / 2 + 44;
-        var yA = yNum + 20;
-        var yB = yNum + 38;
-        var myT = appCtx.teamOfMine();
-        var label = function (team) {
-          return team === myT
-            ? (view.coop ? '我方' : '我')
-            : (view.solo ? (view.botName || 'AI') : '对手');
-        };
-        var saveAlign = ctx.textAlign, saveBase = ctx.textBaseline;
-        ctx.textAlign = 'center';
-        ctx.textBaseline = 'middle';
-        ctx.font = '400 12px -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif';
-        ctx.fillStyle = COL.faint;
-        for (var pn = 1; pn <= nPts; pn += 1) {
-          ctx.fillText(pn + '', x0 + cell + (pn - 0.5) * cell, yNum);
-        }
-        for (var r = 0; r < 2; r += 1) {
-          var ry = r === 0 ? yA : yB;
-          var team = r;                    // 行 = 队伍号
-          ctx.fillStyle = COL.text;
-          ctx.fillText(label(team), x0 + cell / 2, ry);
-          ctx.fillStyle = team === view.winner ? COL.good : COL.text;
-          for (var pt = 0; pt < nPts; pt += 1) {
-            if (pw[pt] === team) ctx.fillText('✓', x0 + cell + (pt + 0.5) * cell, ry);
-          }
-        }
-        ctx.textAlign = saveAlign;
-        ctx.textBaseline = saveBase;
-      }
     }
 
     // 缺人 / 暂停提示

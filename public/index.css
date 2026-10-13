@@ -89,6 +89,19 @@
   .panelbox p { font-size: 13px; color: #93a3bf; margin: 0 0 16px; line-height: 1.6; }
   .panelbox .hint { font-size: 12px; color: #6f7f9c; margin-top: 14px; }
 
+  /* 局终结算逐分表（ui.js 的 showSettlement）：
+     第一列是行标签，后面每分一列；长局（>15 分）超出面板宽时横向滚，不压行高。 */
+  .settle-wrap { overflow-x: auto; max-width: 100%; margin: 4px 0 2px; }
+  /* width:max-content + margin:auto：放得下时居中，放不下时靠左（可横滚），
+     不会像 justify-content:center 那样把溢出部分的左边切掉。 */
+  .settle { display: grid; gap: 5px 2px; width: max-content; margin: 0 auto; font-size: 13px; }
+  .settle > span { text-align: center; line-height: 1.5; }
+  .settle .lbl { text-align: right; padding-right: 6px; color: #93a3bf; }
+  .settle .lbl.win { color: #4ade80; font-weight: 600; }
+  .settle .num { color: #6f7f9c; font-size: 12px; }
+  .settle .hit { color: #4ade80; font-weight: 600; }
+  .settle .miss { color: #33405e; }
+
   button {
     font: inherit; font-size: 14px; cursor: pointer;
     border-radius: 8px; border: 1px solid transparent;
