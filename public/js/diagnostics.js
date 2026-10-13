@@ -115,8 +115,8 @@
     }
     return {
       verdict: verdict,
-      myTeam: app.teamOfMine(),
-      isMyTeamConceded: miss.concededBy === app.teamOfMine(),
+      myTeam: appCtx.teamOfMine(),
+      isMyTeamConceded: miss.concededBy === appCtx.teamOfMine(),
       serverCatchMargin: serverMargin,
       clientRenderedCatchMargin: Math.round(clientMargin * 10) / 10,
       clientVisibleBall: nearest.ball.rendered,
@@ -160,7 +160,7 @@
       matchId: message.mi,
       finalScore: message.s,
       winnerTeam: message.wn,
-      localTeam: app.teamOfMine(),
+      localTeam: appCtx.teamOfMine(),
       serverMissCount: message.mr.length,
       clientFramesCaptured: view.matchFrames.length,
       clientFrameLimitReached: view.matchFrameNo > view.matchFrameLimit,

@@ -37,7 +37,7 @@ PORT=3100 npm start
 |---|---|
 | 球速 / 拍子尺寸 / 手感 | `server.js` **L75** 起的常量区（`BALL_SPEED_START`、`SPEEDUP_PER_HIT`、`PADDLE_SPEED`…） |
 | 九种道具的效果 / 半径 / 刷新频率 | `server.js` **L112** 起的道具常量区 ＋ `server/powerups.js` |
-| 拍子皮肤与技能 | `server.js` **L159**（常量）＋ `server/skills.js` |
+| 拍子皮肤与技能 | `server.js` **L175**（`SKINS` 表）＋ `server/skills.js` |
 | AI 强度 | `server.js` **L323** 起的人机难度区 ＋ `server/bot.js` |
 | 球的运动 / 碰撞 / 反弹 / 防卡死 | `server/physics.js` |
 | 建房/加入/掉线重连/开局/计分/阶段流转 | `server/match.js` |
@@ -46,16 +46,32 @@ PORT=3100 npm start
 | HTTP 路由 / WebSocket 连接与消息分发 | `server.js`（传输层，领域模块里没有 socket） |
 | 界面配色 / 布局 | `public/index.css`（整份就是原来内联的 `<style>` 块） |
 | **手机端布局** | `public/index.css` 的 media query：**L328**（≤760px 窄屏）、**L362**（竖屏）、**L386**（横屏矮窗铺满） |
-| 画面渲染 | `public/index.html` **L1986** 起的渲染区 |
-| 输入（键盘 / 鼠标 / 触摸） | `public/index.html` **L1203**（输入）、**L1280**（触屏） |
-| 背景音乐 / 音效 | `public/index.html` **L653**（声音）、L801（背景音乐） |
-| 探针用的读取钩子 | `public/index.html` **L2040** 的 `__probe()` |
+| 前端各模块 | `public/js/*.js`，依赖见下表 |
+| 探针读取钩子 | `public/js/probe.js`（`window.__probe` / `__bgm` / `__setSound` / `__bgmSrc`） |
 
-依赖方向是单向的：`server/rules.js` 在最底，往上是 `physics` / `bot` / `powerups` / `skills`，
-效果时钟 `effects` 独占暂停冻结语义，`match` 站在这些之上，
-`server.js`（传输）只在最外层装配 —— 没有任何领域模块反向 require 入口文件或互相 require。
+### 前端模块
 
-页面由 `public/index.html`（DOM 骨架 + `<script>`）+ `public/index.css`（样式表）组成，
+`public/index.html` 现在只剩 147 行：DOM 骨架、一行样式表、若干 `<script src>`，以及一段
+34 行的引导代码（造上下文 → 按依赖顺序装模块 → 起音频/画布/循环/连接）。
+**没有任何散装全局变量**，模块之间只通过 `app.<area>` 互相调用。
+用的是 classic script 而不是 `type="module"`，所以**装模块的顺序就是依赖顺序**。
+
+| 模块 | 依赖 | 负责 |
+|---|---|---|
+| `js/context.js` | —— | 共享状态 `view`、只读表、DOM 句柄、`slotsFor`、`teamOfMine`/`ballVis` |
+| `js/audio.js` | context | Web Audio 音效 + 背景音乐（**必须最先装**：capture 相位的解锁监听器） |
+| `js/input.js` | context, audio, net | 键盘 / 触摸 / 本地拍子预测 |
+| `js/ui.js` | context, input, net | 菜单 / 覆盖层 / 技能按钮 / 局间重选拍子 |
+| `js/diagnostics.js` | context | 逐帧取证与页面量表 |
+| `js/render.js` | context, audio, diag, input, ui | 画布、每帧循环、所有绘制 |
+| `js/network.js` | context, audio, diag, input, render, ui | WebSocket、重连、座位凭证（**最后装**：收到消息要回调上面那些） |
+| `js/probe.js` | 全部（只读） | 四个探针钩子（**最后装**：读的是全部就绪后的 app） |
+
+`node tools/check-frontend-smoke.js` 会把菜单 → 建房 → 加入 → 暂停 → 技能 → 退房真跑一遍，
+**任何一条页面未捕获异常都算失败**。拆成多文件之后最容易出的错就是"引用还在、声明没了"，
+而它常常只在一条平时不走的分支上冒出来（实测 `probe.js` 全绿时被 `probe-bgm` 逮到过）。
+
+页面由 `public/index.html` + `public/index.css` + `public/js/*.js` 组成，
 没有构建步骤，改完刷新即生效。
 
 ---
@@ -66,23 +82,24 @@ PORT=3100 npm start
 
 | 脚本 | 覆盖 | 期望 |
 |---|---|---|
-| `test-rules.js` | 纯规则/几何/预测/AI 瞄准/隐形球/暂停冻结/皮肤与三种技能 | 312/0 |
+| `test-rules.js` | 纯规则/几何/预测/AI 瞄准/隐形球/暂停冻结/皮肤与八种技能 | 392/0 |
 | `test-protocol.js` | 协议层（建房/加入/重连/心跳/多球/暂停/皮肤与技能字段） | 86/0 |
 | `tools/check-powerup.js` | 道具生成、拾取、归属、事件格式 | 18/0 |
-| `tools/check-solo.js` | 人机（AI 真的会接球 + 难度可测） | 29/0 |
+| `tools/check-solo.js` | 人机（AI 真的会接球 + 难度可测） | 35/0 |
 | `tools/check-coop.js` | 双人打 AI 的半场划分与边界 | 31/0 |
 | `tools/check-collision.js` | 拍子可接区间的暴力扫描 | 16/0 |
 | `test-physics-sequence.js` | 球物理的更新顺序（位移 → 撞球 → 墙反弹） | 3/0 |
 | `test-lifecycle.js` | 建房/加入/暂停/掉线重连/一局打完/自动开下一局 | 24/0 |
 | `test-cdp-compat.js` | `tools/cdp.js` 旧导出与浏览器生命周期模块的兼容 | 通过 |
-| `tools/probe.js` | 真实浏览器双标签页联机 | 58/0 |
+| `tools/check-frontend-smoke.js` | 前端模块冒烟：走一遍主要流程，**页面任何未捕获异常都算失败** | 24/0 |
+| `tools/probe.js` | 真实浏览器双标签页联机 | 70/0 |
 | `tools/probe-solo.js` | 真实浏览器人机 | 43/0 |
-| `tools/probe-coop.js` | 真实浏览器双人打 AI | 49/0 |
+| `tools/probe-coop.js` | 真实浏览器双人打 AI | 52/0 |
 | `tools/probe-bgm.js` | 音频闸门 / 淡入 / 静音 / Range | 26/0 |
-| `tools/probe-powerup-fx.js` | 九种道具 + 叠加层**真的画出来了** | 31/0 |
-| `tools/probe-mobile.js` | 手机端布局 + 电脑端零回归 + 真实触摸拖动 | 109/0 |
+| `tools/probe-powerup-fx.js` | 九种道具 + 叠加层**真的画出来了** | 32/0 |
+| `tools/probe-mobile.js` | 手机端布局 + 电脑端零回归 + 真实触摸拖动 | 121/0 |
 | `tools/probe-crossplay.js` | 一端真电脑 + 一端真手机，同房互通 | 60/0 |
-| `tools/probe-skills.js` | 三种技能的浏览器端取证（按钮位置/风向/两端球数/蓄力光圈） | 79/0 |
+| `tools/probe-skills.js` | 八种技能的浏览器端取证（按钮位置/风向/两端球数/蓄力光圈） | 82/0 |
 | `tools/probe-ball-lag.js` | "球穿过拍子"的渲染层取证 | 报告型，不判红 |
 | `tools/check-parity.js` | 本地 vs 线上逐字符一致（**发布后**才跑） | 逐字符一致 |
 | `tools/probe-remote.js` | 线上长连接 / 空闲存活 / **真的放一次技能并反算风向** | 46/0（线上） |
@@ -97,6 +114,14 @@ node tools/probe-remote.js https://你的线上地址     # 只在发布后跑
 它们各自用不同的调试端口，可以并行跑。**没装 Edge 也能跑** —— 会退到 Chrome / Chromium；
 想强制指定就设 `PROBE_BROWSER=<浏览器可执行文件绝对路径>`。
 探针的临时 profile 默认落在系统临时目录，想固定位置就设 `PROBE_TMP=<目录>`。
+
+> **这台开发机上有几个已知的环境性失败，不是回归**（文件拆分重构前后一模一样，
+> 见 `.dhcoder/plan/plan-20261012-1808-project-file-splitting.md` 的 Known non-regressions）：
+> - `probe-mobile.js`：`#pingPill` 基线漂移导致 6 条失败（115/6，总数仍是 121）
+> - `probe-bgm.js`：WebAudio 音量衰减时序，1-2 条失败（25/1 或 24/2，总数 26）
+> - `probe-skills.js`：headless 下画布帧计数不前进，1 条失败（81/1，总数 82）
+>
+> 判定是否回归的标准：同一探针**改动前后**的失败条数与原因是否一致，而不是绝对零失败。
 
 ---
 

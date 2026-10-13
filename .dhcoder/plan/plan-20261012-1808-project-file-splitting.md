@@ -151,24 +151,54 @@ Move the inline stylesheet from `public/index.html` to `public/index.css`; keep 
 The current page uses one IIFE whose functions share closure state. Do not split chunks into unrelated scripts that rely on implicit globals. Establish an explicit application context/factory and extract audio, input, UI, network/state, and rendering one area at a time. Keep classic scripts initially; defer `type="module"` conversion.
 
 ### TODOs
-- [ ] Inventory initialization order, shared state, DOM references, and externally observed probe fields before changing the IIFE.
-- [ ] Define the minimal app context passed to each extracted module; avoid duplicate state and circular imports.
-- [ ] Extract audio behavior first, preserving trusted gesture listeners and capture-phase registration; verify autoplay unlock and mute controls.
-- [ ] Extract input behavior next, preserving keyboard, mouse, touch, pointer, and pause/skill bindings.
-- [ ] Extract UI/menu behavior while keeping DOM IDs/classes and session/local storage error handling intact.
-- [ ] Extract network and reconnection behavior, preserving `connect()`, connected-state ordering, pending-message flush, and snapshot consumption.
-- [ ] Extract rendering/canvas behavior last, preserving device-pixel-ratio sizing, animation timing, and resize/orientation handling.
-- [ ] Keep `window.__probe()` available with the same observable fields used by existing probes.
-- [ ] Run the local solo/co-op/mobile/cross-play/skills probes as applicable after each extracted area; compare console errors and screenshots.
+- [x] Inventory initialization order, shared state, DOM references, and externally observed probe fields before changing the IIFE.
+- [x] Define the minimal app context passed to each extracted module; avoid duplicate state and circular imports.
+- [x] Extract audio behavior first, preserving trusted gesture listeners and capture-phase registration; verify autoplay unlock and mute controls.
+- [x] Extract input behavior next, preserving keyboard, mouse, touch, pointer, and pause/skill bindings.
+- [x] Extract UI/menu behavior while keeping DOM IDs/classes and session/local storage error handling intact.
+- [x] Extract network and reconnection behavior, preserving `connect()`, connected-state ordering, pending-message flush, and snapshot consumption.
+- [x] Extract rendering/canvas behavior last, preserving device-pixel-ratio sizing, animation timing, and resize/orientation handling.
+- [x] Keep `window.__probe()` available with the same observable fields used by existing probes.
+- [x] Run the local solo/co-op/mobile/cross-play/skills probes as applicable after each extracted area; compare console errors and screenshots.
 
 ### Acceptance
 - The app loads with no new console or network errors; probes can still inspect the same state.
 - Keyboard, touch, audio unlock, room lifecycle, reconnect, and rendering behavior match the baseline on desktop and mobile.
 
+### Result
+`public/index.html` is now 147 lines: the DOM skeleton, a stylesheet link, eight module
+script tags, and a 34-line boot (create context → attach modules in dependency order →
+start audio / canvas / frame loop / connection). No loose globals remain.
+
+| module | depends on | owns |
+|---|---|---|
+| `js/context.js` | — | shared `view`, read-only tables, DOM handles, `slotsFor`, `teamOfMine`/`ballVis` |
+| `js/audio.js` | context | Web Audio sfx + BGM (must attach first: capture-phase unlock listeners) |
+| `js/input.js` | context, audio, net | keyboard / touch / local paddle prediction |
+| `js/ui.js` | context, input, net | menu / overlay / skill buttons / between-round skin reselect |
+| `js/diagnostics.js` | context | per-frame forensics recorder and on-page meters |
+| `js/render.js` | context, audio, diag, input, ui | canvas, frame loop, all drawing |
+| `js/network.js` | context, audio, diag, input, render, ui | WebSocket, reconnect, seat token (attaches last) |
+| `js/probe.js` | everything (read-only) | the four probe hooks (attaches last of all) |
+
+Classic scripts, not `type="module"`, so attach order **is** dependency order. `W`/`H`
+became `view.W`/`view.H` because they are the only reassigned "constants"; every other
+read-only table is aliased locally, which is provably equivalent since they are never
+reassigned.
+
+Added `tools/check-frontend-smoke.js` after the first two extraction steps. Splitting a
+closure across files fails one specific way — a reference survives the move but its
+declaration does not — and it tends to surface only on a branch that is not always taken:
+`probe.js` stayed fully green through two such bugs that `probe-bgm.js` caught, and
+`SKIN_COL_FROZEN` (used by render, never imported) cost 14 assertions in
+`probe-powerup-fx`. The smoke check walks menu → create → join → pause → skill → leave and
+fails on *any* uncaught page error, and clicks the pause and skill buttons rather than only
+using the keyboard, because those handlers are separate code paths.
+
 ## Phase 9 — Consolidate and Close Out
 
 ### TODOs
-- [ ] Search for duplicated implementations, stale inline code, unused exports, accidental circular dependencies, and imports from the entry point.
+- [x] Search for duplicated implementations, stale inline code, unused exports, accidental circular dependencies, and imports from the entry point.
 - [x] Confirm the final module dependency direction: shared rules/constants at the base; domain modules above them; transport and UI assembly at the outer layer.
 - [x] Run all applicable offline, local-service, browser, and parity checks; document only newly required commands/configuration in the existing project guidance if needed.
 - [x] Review the final diff for behavior changes that were not explicitly planned and revert or separately scope them.
